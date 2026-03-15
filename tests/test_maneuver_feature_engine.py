@@ -12,10 +12,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from acmi_parser import ACMIFrame, ACMIObject
 from maneuver_feature_engine import (
     FEATURE_COLUMNS,
     extract_window_features,
     frames_to_aircraft_df,
+    get_all_aircraft_ids,
     preprocess_timeseries,
 )
 
@@ -35,6 +37,41 @@ def _make_simple_df(n=50, dt=0.1):
         "pitch": np.full(n, 5.0),
         "roll": np.full(n, 15.0),
     })
+
+
+class TestAircraftFiltering:
+    def test_get_all_aircraft_ids_only_accepts_air_fixedwing(self):
+        frames = [
+            ACMIFrame(
+                time=0.0,
+                objects={
+                    "1": ACMIObject(
+                        obj_id="1",
+                        name="F-16C",
+                        obj_type="Air+FixedWing",
+                    ),
+                    "2": ACMIObject(
+                        obj_id="2",
+                        name="KC-135",
+                        obj_type="Air+Refueling",
+                    ),
+                    "3": ACMIObject(
+                        obj_id="3",
+                        name="CVN-73",
+                        obj_type="Sea+Watercraft+AircraftCarrier",
+                    ),
+                    "4": ACMIObject(
+                        obj_id="4",
+                        name="Generic Aircraft",
+                        obj_type="Aircraft",
+                    ),
+                },
+            )
+        ]
+
+        aircraft = get_all_aircraft_ids(frames)
+
+        assert aircraft == {"1": "F-16C"}
 
 
 # ============================================================

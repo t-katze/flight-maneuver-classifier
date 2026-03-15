@@ -1,5 +1,5 @@
 """
-Flight Maneuver Classifier — maneuver_labeler のテスト
+Flight Maneuver Classifier — maneuver_labeler のテスト (14クラス版)
 """
 
 import sys
@@ -11,104 +11,243 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from maneuver_labeler import ManeuverLabeler, MANEUVER_CLASSES
+from maneuver_labeler import ManeuverLabeler, MANEUVER_CLASSES, NUM_CLASSES
 
 
-class TestManeuverLabeler:
-    """ManeuverLabeler のルール判定テスト"""
+# ============================================================
+# 基本飛行クラス (0–4)
+# ============================================================
+
+class TestBasicFlightClasses:
 
     def setup_method(self):
         self.labeler = ManeuverLabeler()
 
-    def test_level_flight(self):
-        """全指標が閾値以下 → Level Flight"""
+    def test_straight_and_level(self):
+        """全指標が閾値以下 → Straight & Level (0)"""
         row = {
-            "roll_std": 2.0, "roll_delta": 1.0,
-            "heading_delta": 1.0, "altitude_slope": 0.5,
+            "heading_delta": 1.0, "heading_std": 1.0,
+            "altitude_slope": 0.5, "speed_delta": 2.0,
+            "roll_std": 2.0, "pitch_mean": 0.0,
         }
         assert self.labeler.label_single(row) == 0
 
-    def test_climb(self):
-        """高度上昇かつ旋回なし → Climb"""
+    def test_acceleration(self):
+        """speed 増加 + 直線 + level → Acceleration (1)"""
         row = {
-            "roll_std": 2.0, "roll_delta": 1.0,
-            "heading_delta": 2.0, "altitude_slope": 5.0,
+            "heading_delta": 1.0, "heading_std": 1.0,
+            "altitude_slope": 0.0, "speed_delta": 10.0,
+            "roll_std": 2.0, "pitch_mean": 0.0,
         }
         assert self.labeler.label_single(row) == 1
 
-    def test_descent(self):
-        """高度降下かつ旋回なし → Descent"""
+    def test_deceleration(self):
+        """speed 減少 + 直線 + level → Deceleration (2)"""
         row = {
-            "roll_std": 2.0, "roll_delta": 1.0,
-            "heading_delta": 2.0, "altitude_slope": -5.0,
+            "heading_delta": 1.0, "heading_std": 1.0,
+            "altitude_slope": 0.0, "speed_delta": -10.0,
+            "roll_std": 2.0, "pitch_mean": 0.0,
         }
         assert self.labeler.label_single(row) == 2
 
-    def test_left_turn(self):
-        """heading_delta < 0 → Left Turn"""
+    def test_steady_climb(self):
+        """altitude 上昇 + 旋回なし → Steady Climb (3)"""
         row = {
-            "roll_std": 5.0, "roll_delta": 3.0,
-            "heading_delta": -10.0, "altitude_slope": 0.0,
+            "heading_delta": 2.0, "heading_std": 1.0,
+            "altitude_slope": 5.0, "speed_delta": 0.0,
+            "roll_std": 2.0, "pitch_mean": 5.0,
         }
         assert self.labeler.label_single(row) == 3
 
-    def test_right_turn(self):
-        """heading_delta > 0 → Right Turn"""
+    def test_steady_descent(self):
+        """altitude 降下 + 旋回なし → Steady Descent (4)"""
         row = {
-            "roll_std": 5.0, "roll_delta": 3.0,
-            "heading_delta": 10.0, "altitude_slope": 0.0,
+            "heading_delta": 2.0, "heading_std": 1.0,
+            "altitude_slope": -5.0, "speed_delta": 0.0,
+            "roll_std": 2.0, "pitch_mean": -3.0,
         }
         assert self.labeler.label_single(row) == 4
 
-    def test_roll_maneuver_by_std(self):
-        """roll_std が大きい → Roll Maneuver"""
+
+# ============================================================
+# 旋回系クラス (5–8)
+# ============================================================
+
+class TestTurnClasses:
+
+    def setup_method(self):
+        self.labeler = ManeuverLabeler()
+
+    def test_level_turn(self):
+        """heading 変化 + altitude flat → Level Turn (5)"""
         row = {
-            "roll_std": 20.0, "roll_delta": 5.0,
-            "heading_delta": 10.0, "altitude_slope": 5.0,
+            "heading_delta": 15.0, "heading_std": 5.0,
+            "altitude_slope": 0.0, "speed_delta": -3.0,
+            "roll_std": 5.0, "pitch_mean": 0.0,
         }
         assert self.labeler.label_single(row) == 5
 
-    def test_roll_maneuver_by_delta(self):
-        """roll_delta が大きい → Roll Maneuver"""
+    def test_level_turn_left(self):
+        """heading 負方向 → Level Turn (5)"""
         row = {
-            "roll_std": 5.0, "roll_delta": 40.0,
-            "heading_delta": 10.0, "altitude_slope": 5.0,
+            "heading_delta": -15.0, "heading_std": 5.0,
+            "altitude_slope": 0.0, "speed_delta": -3.0,
+            "roll_std": 5.0, "pitch_mean": 0.0,
         }
         assert self.labeler.label_single(row) == 5
 
-    def test_roll_priority_over_turn(self):
-        """Roll Maneuver が Turn より優先される"""
+    def test_climbing_turn(self):
+        """heading 変化 + altitude 上昇 → Climbing Turn (6)"""
         row = {
-            "roll_std": 25.0, "roll_delta": 50.0,
-            "heading_delta": -20.0, "altitude_slope": 0.0,
+            "heading_delta": 20.0, "heading_std": 5.0,
+            "altitude_slope": 5.0, "speed_delta": -5.0,
+            "roll_std": 5.0, "pitch_mean": 5.0,
         }
-        # heading_delta で Left Turn にもなり得るが、Roll 優先
-        assert self.labeler.label_single(row) == 5
+        assert self.labeler.label_single(row) == 6
 
-    def test_turn_priority_over_climb(self):
-        """Turn が Climb/Descent より優先される"""
+    def test_descending_turn(self):
+        """heading 変化 + altitude 降下 → Descending Turn (7)"""
         row = {
-            "roll_std": 3.0, "roll_delta": 2.0,
-            "heading_delta": 15.0, "altitude_slope": 5.0,
+            "heading_delta": -20.0, "heading_std": 5.0,
+            "altitude_slope": -5.0, "speed_delta": -3.0,
+            "roll_std": 5.0, "pitch_mean": -3.0,
         }
-        # Climb でもあるが、Turn 優先
-        assert self.labeler.label_single(row) == 4
+        assert self.labeler.label_single(row) == 7
 
-    def test_custom_thresholds(self):
-        """閾値を変更可能"""
-        labeler = ManeuverLabeler(thresholds={
-            "heading_delta_threshold": 20.0,  # 閾値を大きくする
-        })
+    def test_high_g_turn(self):
+        """heading 変化 + speed 大幅減少 → High-G Turn (8)"""
         row = {
-            "roll_std": 2.0, "roll_delta": 1.0,
-            "heading_delta": 10.0, "altitude_slope": 0.0,  # 10° は閾値以下
+            "heading_delta": 30.0, "heading_std": 8.0,
+            "altitude_slope": 0.0, "speed_delta": -25.0,
+            "roll_std": 10.0, "pitch_mean": 2.0,
         }
-        # heading_delta=10 < threshold=20 → Level Flight
-        assert labeler.label_single(row) == 0
+        assert self.labeler.label_single(row) == 8
 
+
+# ============================================================
+# 戦術機動クラス (9–13)
+# ============================================================
+
+class TestTacticalClasses:
+
+    def setup_method(self):
+        self.labeler = ManeuverLabeler()
+
+    def test_dive(self):
+        """pitch 大きく負 + altitude 急降下 + speed 増加 → Dive (9)"""
+        row = {
+            "heading_delta": 2.0, "heading_std": 2.0,
+            "altitude_slope": -20.0, "speed_delta": 15.0,
+            "roll_std": 3.0, "pitch_mean": -25.0,
+        }
+        assert self.labeler.label_single(row) == 9
+
+    def test_zoom_climb(self):
+        """pitch 大きく正 + altitude 急上昇 + speed 減少 → Zoom Climb (10)"""
+        row = {
+            "heading_delta": 2.0, "heading_std": 2.0,
+            "altitude_slope": 20.0, "speed_delta": -15.0,
+            "roll_std": 3.0, "pitch_mean": 25.0,
+        }
+        assert self.labeler.label_single(row) == 10
+
+    def test_reversal(self):
+        """heading 大幅変化 (≥120°) → Reversal (11)"""
+        row = {
+            "heading_delta": 150.0, "heading_std": 30.0,
+            "altitude_slope": -5.0, "speed_delta": -10.0,
+            "roll_std": 15.0, "pitch_mean": -10.0,
+        }
+        assert self.labeler.label_single(row) == 11
+
+    def test_reversal_negative(self):
+        """heading 大幅変化 (負方向) → Reversal (11)"""
+        row = {
+            "heading_delta": -130.0, "heading_std": 30.0,
+            "altitude_slope": 5.0, "speed_delta": -10.0,
+            "roll_std": 15.0, "pitch_mean": 10.0,
+        }
+        assert self.labeler.label_single(row) == 11
+
+    def test_jinking(self):
+        """roll_std + heading_std が大きい → Jinking (12)"""
+        row = {
+            "heading_delta": 5.0, "heading_std": 15.0,
+            "altitude_slope": 0.0, "speed_delta": 0.0,
+            "roll_std": 25.0, "pitch_mean": 0.0,
+        }
+        assert self.labeler.label_single(row) == 12
+
+    def test_extension(self):
+        """speed 増加 + 直線 + 微降下 → Extension (13)"""
+        row = {
+            "heading_delta": 2.0, "heading_std": 2.0,
+            "altitude_slope": -1.0, "speed_delta": 10.0,
+            "roll_std": 3.0, "pitch_mean": -1.0,
+        }
+        assert self.labeler.label_single(row) == 13
+
+
+# ============================================================
+# 優先度テスト
+# ============================================================
+
+class TestPriorityRules:
+
+    def setup_method(self):
+        self.labeler = ManeuverLabeler()
+
+    def test_jinking_over_turn(self):
+        """Jinking が Turn より優先"""
+        row = {
+            "heading_delta": 20.0, "heading_std": 15.0,
+            "altitude_slope": 0.0, "speed_delta": 0.0,
+            "roll_std": 25.0, "pitch_mean": 0.0,
+        }
+        assert self.labeler.label_single(row) == 12
+
+    def test_reversal_over_high_g(self):
+        """Reversal が High-G Turn より優先"""
+        row = {
+            "heading_delta": 150.0, "heading_std": 20.0,
+            "altitude_slope": 0.0, "speed_delta": -30.0,
+            "roll_std": 10.0, "pitch_mean": 0.0,
+        }
+        assert self.labeler.label_single(row) == 11
+
+    def test_high_g_over_level_turn(self):
+        """High-G Turn が Level Turn より優先"""
+        row = {
+            "heading_delta": 30.0, "heading_std": 8.0,
+            "altitude_slope": 0.0, "speed_delta": -20.0,
+            "roll_std": 10.0, "pitch_mean": 0.0,
+        }
+        assert self.labeler.label_single(row) == 8
+
+    def test_climb_over_acceleration(self):
+        """Steady Climb が Acceleration より優先"""
+        row = {
+            "heading_delta": 1.0, "heading_std": 1.0,
+            "altitude_slope": 5.0, "speed_delta": 10.0,
+            "roll_std": 2.0, "pitch_mean": 5.0,
+        }
+        assert self.labeler.label_single(row) == 3
+
+    def test_dive_over_descent(self):
+        """Dive が Steady Descent より優先"""
+        row = {
+            "heading_delta": 2.0, "heading_std": 2.0,
+            "altitude_slope": -15.0, "speed_delta": 10.0,
+            "roll_std": 3.0, "pitch_mean": -20.0,
+        }
+        assert self.labeler.label_single(row) == 9
+
+
+# ============================================================
+# DataFrame / 設定テスト
+# ============================================================
 
 class TestLabelDataFrame:
-    """label_dataframe のテスト"""
 
     def setup_method(self):
         self.labeler = ManeuverLabeler()
@@ -116,27 +255,18 @@ class TestLabelDataFrame:
     def test_labels_added(self):
         """DataFrame に label / label_name 列が追加される"""
         df = pd.DataFrame({
-            "roll_std": [2.0, 20.0],
-            "roll_delta": [1.0, 5.0],
-            "heading_delta": [1.0, 0.0],
-            "altitude_slope": [0.0, 0.0],
+            "heading_delta": [1.0, 150.0],
+            "heading_std": [1.0, 30.0],
+            "altitude_slope": [0.0, -5.0],
+            "speed_delta": [0.0, -10.0],
+            "roll_std": [2.0, 15.0],
+            "pitch_mean": [0.0, -10.0],
         })
         result = self.labeler.label_dataframe(df)
         assert "label" in result.columns
         assert "label_name" in result.columns
-        assert result.iloc[0]["label"] == 0  # Level Flight
-        assert result.iloc[1]["label"] == 5  # Roll Maneuver
-
-    def test_label_names_correct(self):
-        """label_name が MANEUVER_CLASSES に対応"""
-        df = pd.DataFrame({
-            "roll_std": [2.0],
-            "roll_delta": [1.0],
-            "heading_delta": [-10.0],
-            "altitude_slope": [0.0],
-        })
-        result = self.labeler.label_dataframe(df)
-        assert result.iloc[0]["label_name"] == "Left Turn"
+        assert result.iloc[0]["label"] == 0   # Straight & Level
+        assert result.iloc[1]["label"] == 11  # Reversal
 
     def test_empty_dataframe(self):
         """空 DataFrame"""
@@ -144,14 +274,20 @@ class TestLabelDataFrame:
         result = self.labeler.label_dataframe(df)
         assert "label" in result.columns
 
-    def test_all_classes_possible(self):
-        """6クラス全てが出力可能"""
-        df = pd.DataFrame({
-            "roll_std":       [2.0,  2.0,  2.0,  5.0, 5.0, 20.0],
-            "roll_delta":     [1.0,  1.0,  1.0,  3.0, 3.0, 40.0],
-            "heading_delta":  [1.0,  1.0,  1.0, -10., 10., 0.0],
-            "altitude_slope": [0.5,  5.0, -5.0,  0.0, 0.0, 0.0],
+    def test_custom_thresholds(self):
+        """閾値をカスタマイズ"""
+        labeler = ManeuverLabeler(thresholds={
+            "heading_delta_threshold": 30.0,
         })
-        result = self.labeler.label_dataframe(df)
-        labels = set(result["label"].tolist())
-        assert labels == {0, 1, 2, 3, 4, 5}
+        row = {
+            "heading_delta": 20.0, "heading_std": 5.0,
+            "altitude_slope": 0.0, "speed_delta": 0.0,
+            "roll_std": 2.0, "pitch_mean": 0.0,
+        }
+        # 20° < threshold 30° → not a turn → Straight & Level
+        assert labeler.label_single(row) == 0
+
+    def test_num_classes(self):
+        """14クラスが定義されている"""
+        assert NUM_CLASSES == 14
+        assert len(MANEUVER_CLASSES) == 14

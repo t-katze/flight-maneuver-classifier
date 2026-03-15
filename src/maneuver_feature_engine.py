@@ -16,9 +16,20 @@ import numpy as np
 import pandas as pd
 
 
+ANALYSIS_AIRCRAFT_TYPE = "air+fixedwing"
+
+
 # ============================================================
 # ACMI フレーム → 航空機時系列 DataFrame
 # ============================================================
+
+def is_analysis_target_aircraft(obj) -> bool:
+    """機動分類の解析対象かどうかを判定する。"""
+    return (
+        obj is not None
+        and str(getattr(obj, "obj_type", "")).strip().lower() == ANALYSIS_AIRCRAFT_TYPE
+    )
+
 
 def frames_to_aircraft_df(frames, aircraft_id: str) -> pd.DataFrame:
     """
@@ -65,7 +76,7 @@ def get_all_aircraft_ids(frames) -> dict[str, str]:
     aircraft = {}
     for frame in frames:
         for oid, obj in frame.objects.items():
-            if oid not in aircraft and obj.is_aircraft() and obj.name:
+            if oid not in aircraft and is_analysis_target_aircraft(obj) and obj.name:
                 aircraft[oid] = obj.name
     return aircraft
 

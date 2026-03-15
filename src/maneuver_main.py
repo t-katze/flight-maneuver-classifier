@@ -34,6 +34,7 @@ from maneuver_feature_engine import (
     build_feature_matrix,
     get_all_aircraft_ids,
 )
+from maneuver_acmi_export import annotate_acmi_file
 from maneuver_labeler import ManeuverLabeler, MANEUVER_CLASSES
 from maneuver_classifier import train_and_evaluate, save_model
 
@@ -45,6 +46,8 @@ def run_pipeline(
     output_dir: str = "results",
     aircraft_filter: str | None = None,
     thresholds: dict | None = None,
+    annotate_acmi: bool = True,
+    annotated_acmi_path: str | None = None,
 ) -> dict:
     """
     機動分類パイプラインを一括実行する。
@@ -56,6 +59,8 @@ def run_pipeline(
         output_dir: 結果出力先ディレクトリ
         aircraft_filter: 特定の航空機IDのみ処理 (None=全て)
         thresholds: ルールベースラベラーの閾値 (None=デフォルト)
+        annotate_acmi: True の場合、注釈付き ACMI も自動出力する
+        annotated_acmi_path: 出力先 ACMI パス (None=output_dir 配下に自動決定)
 
     Returns:
         評価結果辞書 (maneuver_classifier.train_and_evaluate の戻り値)
@@ -107,6 +112,7 @@ def run_pipeline(
     labeler = ManeuverLabeler(thresholds=thresholds)
     labeled_df = labeler.label_dataframe(features_df)
     labeler.print_distribution(labeled_df)
+    export_df = labeled_df.copy()
 
     # ========== データ十分性チェック ==========
     unique_labels = labeled_df["label"].nunique()
@@ -114,7 +120,14 @@ def run_pipeline(
         print(f"\n[ManeuverMain] ⚠ ラベルが {unique_labels} 種類しかありません（最低2種類必要）")
         print("[ManeuverMain] ルールの閾値を調整するか、データを増やしてください")
         # CSV は保存する
-        _save_csv(labeled_df, output_dir)
+        csv_path = _save_csv(export_df, output_dir)
+        _maybe_export_annotated_acmi(
+            acmi_path=acmi_path,
+            labels_csv_path=csv_path,
+            output_dir=output_dir,
+            annotate_acmi=annotate_acmi,
+            annotated_acmi_path=annotated_acmi_path,
+        )
         return {}
 
     # 各クラスで最低2サンプル必要（stratify のため）
@@ -122,7 +135,14 @@ def run_pipeline(
     valid_labels = label_counts[label_counts >= 2].index.tolist()
     if len(valid_labels) < 2:
         print(f"\n[ManeuverMain] ⚠ 2サンプル以上のクラスが2種類未満です")
-        _save_csv(labeled_df, output_dir)
+        csv_path = _save_csv(export_df, output_dir)
+        _maybe_export_annotated_acmi(
+            acmi_path=acmi_path,
+            labels_csv_path=csv_path,
+            output_dir=output_dir,
+            annotate_acmi=annotate_acmi,
+            annotated_acmi_path=annotated_acmi_path,
+        )
         return {}
 
     # サンプル不足クラスを除外
@@ -143,11 +163,29 @@ def run_pipeline(
     )
 
     # ========== 7. 結果保存 ==========
-    _save_csv(labeled_df, output_dir)
+    csv_path = _save_csv(labeled_df, output_dir)
 
     if results.get("model"):
         model_path = str(Path(output_dir) / "maneuver_rf_model.joblib")
         save_model(results["model"], FEATURE_COLUMNS, model_path)
+        export_df["predicted_label"] = results["model"].predict(
+            export_df[FEATURE_COLUMNS].values.astype(np.float64)
+        ).astype(int)
+        export_df["predicted_label_name"] = export_df["predicted_label"].map(
+            MANEUVER_CLASSES
+        )
+
+    csv_path = _save_csv(export_df, output_dir)
+
+    annotated_path = _maybe_export_annotated_acmi(
+        acmi_path=acmi_path,
+        labels_csv_path=csv_path,
+        output_dir=output_dir,
+        annotate_acmi=annotate_acmi,
+        annotated_acmi_path=annotated_acmi_path,
+    )
+    if annotated_path:
+        results["annotated_acmi_path"] = annotated_path
 
     print(f"\n[ManeuverMain] === 完了 ===")
     print(f"  結果ディレクトリ: {output_dir}")
@@ -162,6 +200,48 @@ def _save_csv(df: pd.DataFrame, output_dir: str):
     csv_path = out / "maneuver_features_labeled.csv"
     df.to_csv(csv_path, index=False)
     print(f"[ManeuverMain] CSV saved → {csv_path}")
+    return str(csv_path)
+
+
+def _default_annotated_acmi_path(acmi_path: str, output_dir: str) -> str:
+    source = Path(acmi_path)
+    output = Path(output_dir)
+    name = source.name
+
+    if name.endswith(".zip.acmi"):
+        return str(output / f"{name[:-9]}.maneuver.zip.acmi")
+    if name.endswith(".acmi"):
+        return str(output / f"{source.stem}.maneuver.acmi")
+    return str(output / f"{name}.maneuver.acmi")
+
+
+def _maybe_export_annotated_acmi(
+    acmi_path: str,
+    labels_csv_path: str,
+    output_dir: str,
+    annotate_acmi: bool,
+    annotated_acmi_path: str | None = None,
+) -> str | None:
+    if not annotate_acmi:
+        return None
+
+    output_path = annotated_acmi_path or _default_annotated_acmi_path(
+        acmi_path,
+        output_dir,
+    )
+
+    try:
+        result = annotate_acmi_file(
+            acmi_path=acmi_path,
+            labels_csv_path=labels_csv_path,
+            output_path=output_path,
+        )
+    except Exception as exc:
+        print(f"[ManeuverMain] ⚠ 注釈付き ACMI の出力に失敗: {exc}")
+        return None
+
+    print(f"[ManeuverMain] Annotated ACMI saved → {result['output_path']}")
+    return str(result["output_path"])
 
 
 # ============================================================
@@ -193,23 +273,48 @@ def main():
         "--list-aircraft", action="store_true",
         help="航空機一覧を表示して終了",
     )
+    parser.add_argument(
+        "--no-annotate-acmi", action="store_true",
+        help="注釈付き ACMI の自動出力を無効化",
+    )
+    parser.add_argument(
+        "--annotated-acmi-output", default=None,
+        help="注釈付き ACMI の出力先 (default: output-dir 配下に自動決定)",
+    )
 
-    # ルールベースラベラーの閾値
-    parser.add_argument(
-        "--roll-std-th", type=float, default=15.0,
-        help="Roll Maneuver 判定用 roll_std 閾値 (deg, default: 15.0)",
-    )
-    parser.add_argument(
-        "--roll-delta-th", type=float, default=30.0,
-        help="Roll Maneuver 判定用 |roll_delta| 閾値 (deg, default: 30.0)",
-    )
-    parser.add_argument(
+    # ルールベースラベラーの閾値 (14クラス版)
+    th_group = parser.add_argument_group("ラベラー閾値 (上級)")
+    th_group.add_argument(
         "--heading-delta-th", type=float, default=5.0,
-        help="Turn 判定用 heading_delta 閾値 (deg, default: 5.0)",
+        help="旋回判定 heading_delta 閾値 (deg, default: 5.0)",
     )
-    parser.add_argument(
+    th_group.add_argument(
+        "--heading-reversal-th", type=float, default=120.0,
+        help="Reversal 判定 heading_delta 閾値 (deg, default: 120.0)",
+    )
+    th_group.add_argument(
         "--altitude-slope-th", type=float, default=2.0,
-        help="Climb/Descent 判定用 altitude_slope 閾値 (m/s, default: 2.0)",
+        help="Climb/Descent 判定 altitude_slope 閾値 (m/s, default: 2.0)",
+    )
+    th_group.add_argument(
+        "--altitude-slope-steep", type=float, default=10.0,
+        help="Dive/Zoom 判定 altitude_slope 閾値 (m/s, default: 10.0)",
+    )
+    th_group.add_argument(
+        "--speed-delta-th", type=float, default=5.0,
+        help="加速/減速判定 speed_delta 閾値 (m/s, default: 5.0)",
+    )
+    th_group.add_argument(
+        "--speed-loss-highg", type=float, default=15.0,
+        help="High-G Turn 判定 speed 損失閾値 (m/s, default: 15.0)",
+    )
+    th_group.add_argument(
+        "--roll-std-jinking", type=float, default=20.0,
+        help="Jinking 判定 roll_std 閾値 (deg, default: 20.0)",
+    )
+    th_group.add_argument(
+        "--heading-std-jinking", type=float, default=10.0,
+        help="Jinking 判定 heading_std 閾値 (deg, default: 10.0)",
     )
 
     args = parser.parse_args()
@@ -227,10 +332,14 @@ def main():
 
     # ---- パイプライン実行 ----
     thresholds = {
-        "roll_std_threshold": args.roll_std_th,
-        "roll_delta_threshold": args.roll_delta_th,
         "heading_delta_threshold": args.heading_delta_th,
+        "heading_reversal_threshold": args.heading_reversal_th,
         "altitude_slope_threshold": args.altitude_slope_th,
+        "altitude_slope_steep": args.altitude_slope_steep,
+        "speed_delta_threshold": args.speed_delta_th,
+        "speed_loss_highg": args.speed_loss_highg,
+        "roll_std_jinking": args.roll_std_jinking,
+        "heading_std_jinking": args.heading_std_jinking,
     }
 
     run_pipeline(
@@ -240,6 +349,8 @@ def main():
         output_dir=args.output_dir,
         aircraft_filter=args.aircraft_id,
         thresholds=thresholds,
+        annotate_acmi=not args.no_annotate_acmi,
+        annotated_acmi_path=args.annotated_acmi_output,
     )
 
 

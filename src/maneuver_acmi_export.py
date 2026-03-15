@@ -129,13 +129,22 @@ def load_labeled_windows(csv_path: str) -> pd.DataFrame:
             f"Missing required label columns: {', '.join(sorted(missing))}"
         )
 
+    labels_df = labels_df.copy()
     if "label_name" not in labels_df.columns:
         if "label" not in labels_df.columns:
             raise ValueError("Labels CSV must contain either 'label_name' or 'label'.")
-        labels_df = labels_df.copy()
         labels_df["label_name"] = labels_df["label"].map(MANEUVER_CLASSES).fillna("Unknown")
 
-    labels_df = labels_df.copy()
+    if "rule_based_label" not in labels_df.columns and "label" in labels_df.columns:
+        labels_df["rule_based_label"] = labels_df["label"]
+    if "rule_based_label_name" not in labels_df.columns and "label_name" in labels_df.columns:
+        labels_df["rule_based_label_name"] = labels_df["label_name"]
+
+    if "predicted_label_name" not in labels_df.columns and "predicted_label" in labels_df.columns:
+        labels_df["predicted_label_name"] = labels_df["predicted_label"].map(
+            MANEUVER_CLASSES
+        ).fillna("Unknown")
+
     labels_df["aircraft_id"] = labels_df["aircraft_id"].map(_normalize_object_id)
     return labels_df
 
@@ -198,15 +207,34 @@ def build_annotation_schedule(
             frame_index = max(frame_index, first_frame_by_object[aircraft_id])
         frame_key = frame_texts[frame_index]
 
+        primary_label_name = getattr(row, "predicted_label_name", None) or row.label_name
+        primary_label = getattr(row, "predicted_label", None)
+        if primary_label is None or pd.isna(primary_label):
+            primary_label = getattr(row, "label", None)
+
         properties = [
-            f"{property_prefix}Label={_escape_acmi_text(row.label_name)}",
+            f"{property_prefix}Label={_escape_acmi_text(primary_label_name)}",
             f"{property_prefix}WindowStart={_format_number(row.window_start)}",
             f"{property_prefix}WindowEnd={_format_number(row.window_end)}",
             f"{property_prefix}SampleTime={_format_number(anchor_time)}",
         ]
 
-        if hasattr(row, "label") and not pd.isna(row.label):
-            properties.insert(1, f"{property_prefix}LabelId={int(row.label)}")
+        if primary_label is not None and not pd.isna(primary_label):
+            properties.insert(1, f"{property_prefix}LabelId={int(primary_label)}")
+
+        rule_based_label_name = getattr(row, "rule_based_label_name", None)
+        if not rule_based_label_name:
+            rule_based_label_name = getattr(row, "label_name", None)
+        if rule_based_label_name:
+            properties.append(
+                f"{property_prefix}RuleBasedLabel={_escape_acmi_text(rule_based_label_name)}"
+            )
+
+        rule_based_label = getattr(row, "rule_based_label", None)
+        if rule_based_label is None or pd.isna(rule_based_label):
+            rule_based_label = getattr(row, "label", None)
+        if rule_based_label is not None and not pd.isna(rule_based_label):
+            properties.append(f"{property_prefix}RuleBasedLabelId={int(rule_based_label)}")
 
         scheduled_updates.setdefault(frame_key, {})[aircraft_id] = (
             f"{aircraft_id}," + ",".join(properties)
