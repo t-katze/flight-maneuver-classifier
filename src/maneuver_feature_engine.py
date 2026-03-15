@@ -5,10 +5,10 @@ ACMI フレームデータから航空機ごとの時系列を構築し、
 短時間窓ベースの特徴量を抽出する。
 
 特徴量 (各窓あたり):
-    - 平均 (mean): altitude, speed, heading, pitch, roll
-    - 標準偏差 (std): altitude, speed, heading, pitch, roll
-    - 始端終端差 (delta): altitude, speed, heading, pitch, roll
-    - 線形傾き (slope): altitude, speed, heading, pitch, roll
+    - 平均 (mean): altitude, speed, heading, pitch, roll, g_load
+    - 標準偏差 (std): altitude, speed, heading, pitch, roll, g_load
+    - 始端終端差 (delta): altitude, speed, heading, pitch, roll, g_load
+    - 線形傾き (slope): altitude, speed, heading, pitch, roll, g_load
     - 派生特徴量: altitude_rate, heading_rate, roll_abs_mean
 """
 
@@ -40,7 +40,7 @@ def frames_to_aircraft_df(frames, aircraft_id: str) -> pd.DataFrame:
         aircraft_id: 抽出する航空機のオブジェクトID
 
     Returns:
-        DataFrame (columns: time, altitude, speed, heading, pitch, roll)
+        DataFrame (columns: time, altitude, speed, heading, pitch, roll, g_load)
         該当機が存在しないフレームはスキップされる。
     """
     rows = []
@@ -55,11 +55,12 @@ def frames_to_aircraft_df(frames, aircraft_id: str) -> pd.DataFrame:
             "heading": obj.yaw,             # deg
             "pitch": obj.pitch,             # deg
             "roll": obj.roll,               # deg
+            "g_load": obj.g_load,           # G
         })
 
     if not rows:
         return pd.DataFrame(columns=["time", "altitude", "speed",
-                                      "heading", "pitch", "roll"])
+                                      "heading", "pitch", "roll", "g_load"])
 
     df = pd.DataFrame(rows)
     df = df.sort_values("time").reset_index(drop=True)
@@ -123,7 +124,10 @@ def preprocess_timeseries(df: pd.DataFrame) -> pd.DataFrame:
             df["pitch"] = np.rad2deg(np.unwrap(rad))
 
     # 欠損補間
-    numeric_cols = ["altitude", "speed", "heading", "pitch", "roll"]
+    if "g_load" not in df.columns:
+        df["g_load"] = 1.0
+
+    numeric_cols = ["altitude", "speed", "heading", "pitch", "roll", "g_load"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -138,7 +142,7 @@ def preprocess_timeseries(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 # 特徴量カラムの基底チャネル
-_BASE_CHANNELS = ["altitude", "speed", "heading", "pitch", "roll"]
+_BASE_CHANNELS = ["altitude", "speed", "heading", "pitch", "roll", "g_load"]
 
 # 特徴量サフィックス (基底チャネル × サフィックス)
 _SUFFIXES = ["mean", "std", "delta", "slope"]
@@ -161,7 +165,7 @@ def extract_window_features(
     スライディングウィンドウで特徴量を抽出する。
 
     Args:
-        df: 前処理済み時系列 DataFrame (time, altitude, speed, heading, pitch, roll)
+        df: 前処理済み時系列 DataFrame
         window_sec: 窓幅 (秒)
         step_sec: ステップ (秒)
 
@@ -171,6 +175,10 @@ def extract_window_features(
     """
     if df.empty or len(df) < 2:
         return pd.DataFrame(columns=["window_start", "window_end"] + FEATURE_COLUMNS)
+
+    df = df.copy()
+    if "g_load" not in df.columns:
+        df["g_load"] = 1.0
 
     times = df["time"].values.astype(float)
     t_min, t_max = times[0], times[-1]

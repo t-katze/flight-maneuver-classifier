@@ -36,6 +36,8 @@ def train_from_acmi_files(
     recursive: bool = False,
     annotate_inputs: bool = True,
     prediction_output_dir: str | None = None,
+    model_type: str = "random_forest",
+    use_gpu: bool = False,
 ) -> dict:
     acmi_paths = expand_acmi_inputs(acmi_paths, recursive=recursive)
     print(f"[ManeuverTrain] Inputs: {len(acmi_paths)} ACMI files")
@@ -73,10 +75,17 @@ def train_from_acmi_files(
         y,
         feature_names=FEATURE_COLUMNS,
         output_dir=output_dir,
+        model_type=model_type,
+        use_gpu=use_gpu,
     )
 
-    model_path = str(Path(output_dir) / "maneuver_rf_model.joblib")
-    save_model(results["model"], FEATURE_COLUMNS, model_path)
+    model_path = str(Path(output_dir) / _default_model_filename(model_type))
+    save_model(
+        results["model"],
+        FEATURE_COLUMNS,
+        model_path,
+        metadata={"model_type": model_type, "use_gpu": use_gpu},
+    )
 
     export_with_pred = add_model_predictions(export_df, results["model"], FEATURE_COLUMNS)
     csv_path = save_labeled_dataframe(
@@ -135,6 +144,12 @@ def _export_predictions_for_inputs(
     return outputs
 
 
+def _default_model_filename(model_type: str) -> str:
+    if model_type == "xgboost":
+        return "maneuver_xgboost_model.joblib"
+    return "maneuver_rf_model.joblib"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train maneuver model from one or more Tacview ACMI files or directories"
@@ -148,6 +163,17 @@ def main():
     parser.add_argument("--step", type=float, default=1.0)
     parser.add_argument("--output-dir", default="results/train")
     parser.add_argument("--aircraft-id", default=None)
+    parser.add_argument(
+        "--model-type",
+        choices=["random_forest", "xgboost"],
+        default="random_forest",
+        help="学習に使う分類器 (default: random_forest)",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="XGBoost 選択時に CUDA GPU を使用する",
+    )
     parser.add_argument(
         "--recursive",
         action="store_true",
@@ -196,6 +222,8 @@ def main():
         recursive=args.recursive,
         annotate_inputs=not args.no_annotate_inputs,
         prediction_output_dir=args.prediction_output_dir,
+        model_type=args.model_type,
+        use_gpu=args.use_gpu,
     )
 
 

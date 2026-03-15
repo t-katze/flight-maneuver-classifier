@@ -14,7 +14,7 @@ Usage:
     3. 前処理 (角度 unwrap, 欠損補間)
     4. スライディングウィンドウ特徴量抽出
     5. ルールベース仮ラベル付与
-    6. Random Forest 学習・評価
+    6. Random Forest / XGBoost 学習・評価
     7. 結果出力 (コンソール + 画像 + CSV)
 """
 
@@ -48,6 +48,8 @@ def run_pipeline(
     thresholds: dict | None = None,
     annotate_acmi: bool = True,
     annotated_acmi_path: str | None = None,
+    model_type: str = "random_forest",
+    use_gpu: bool = False,
 ) -> dict:
     """
     機動分類パイプラインを一括実行する。
@@ -61,6 +63,8 @@ def run_pipeline(
         thresholds: ルールベースラベラーの閾値 (None=デフォルト)
         annotate_acmi: True の場合、注釈付き ACMI も自動出力する
         annotated_acmi_path: 出力先 ACMI パス (None=output_dir 配下に自動決定)
+        model_type: "random_forest" または "xgboost"
+        use_gpu: True の場合、XGBoost で CUDA GPU を使用する
 
     Returns:
         評価結果辞書 (maneuver_classifier.train_and_evaluate の戻り値)
@@ -152,7 +156,7 @@ def run_pipeline(
         print(f"\n[ManeuverMain] ⚠ サンプル不足で除外: {removed_names}")
         labeled_df = labeled_df[labeled_df["label"].isin(valid_labels)].copy()
 
-    # ========== 6. Random Forest 学習・評価 ==========
+    # ========== 6. 学習・評価 ==========
     X = labeled_df[FEATURE_COLUMNS].values.astype(np.float64)
     y = labeled_df["label"].values.astype(int)
 
@@ -160,14 +164,21 @@ def run_pipeline(
         X, y,
         feature_names=FEATURE_COLUMNS,
         output_dir=output_dir,
+        model_type=model_type,
+        use_gpu=use_gpu,
     )
 
     # ========== 7. 結果保存 ==========
     csv_path = _save_csv(labeled_df, output_dir)
 
     if results.get("model"):
-        model_path = str(Path(output_dir) / "maneuver_rf_model.joblib")
-        save_model(results["model"], FEATURE_COLUMNS, model_path)
+        model_path = str(Path(output_dir) / _default_model_filename(model_type))
+        save_model(
+            results["model"],
+            FEATURE_COLUMNS,
+            model_path,
+            metadata={"model_type": model_type, "use_gpu": use_gpu},
+        )
         export_df["predicted_label"] = results["model"].predict(
             export_df[FEATURE_COLUMNS].values.astype(np.float64)
         ).astype(int)
@@ -201,6 +212,12 @@ def _save_csv(df: pd.DataFrame, output_dir: str):
     df.to_csv(csv_path, index=False)
     print(f"[ManeuverMain] CSV saved → {csv_path}")
     return str(csv_path)
+
+
+def _default_model_filename(model_type: str) -> str:
+    if model_type == "xgboost":
+        return "maneuver_xgboost_model.joblib"
+    return "maneuver_rf_model.joblib"
 
 
 def _default_annotated_acmi_path(acmi_path: str, output_dir: str) -> str:
@@ -270,6 +287,17 @@ def main():
         help="特定の航空機IDのみ処理",
     )
     parser.add_argument(
+        "--model-type",
+        choices=["random_forest", "xgboost"],
+        default="random_forest",
+        help="学習に使う分類器 (default: random_forest)",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="XGBoost 選択時に CUDA GPU を使用する",
+    )
+    parser.add_argument(
         "--list-aircraft", action="store_true",
         help="航空機一覧を表示して終了",
     )
@@ -282,7 +310,7 @@ def main():
         help="注釈付き ACMI の出力先 (default: output-dir 配下に自動決定)",
     )
 
-    # ルールベースラベラーの閾値 (14クラス版)
+    # ルールベースラベラーの閾値 (14クラス / G-Load対応版)
     th_group = parser.add_argument_group("ラベラー閾値 (上級)")
     th_group.add_argument(
         "--heading-delta-th", type=float, default=5.0,
@@ -305,16 +333,24 @@ def main():
         help="加速/減速判定 speed_delta 閾値 (m/s, default: 5.0)",
     )
     th_group.add_argument(
-        "--speed-loss-highg", type=float, default=15.0,
-        help="High-G Turn 判定 speed 損失閾値 (m/s, default: 15.0)",
+        "--g-load-high-g", type=float, default=4.0,
+        help="High-G Turn 判定 g_load 閾値 (G, default: 4.0)",
     )
     th_group.add_argument(
-        "--roll-std-jinking", type=float, default=20.0,
-        help="Jinking 判定 roll_std 閾値 (deg, default: 20.0)",
+        "--g-load-unloaded", type=float, default=0.5,
+        help="Dive 判定 unloaded g_load 閾値 (G, default: 0.5)",
     )
     th_group.add_argument(
-        "--heading-std-jinking", type=float, default=10.0,
-        help="Jinking 判定 heading_std 閾値 (deg, default: 10.0)",
+        "--g-load-zoom", type=float, default=2.0,
+        help="Zoom Climb 判定 g_load 閾値 (G, default: 2.0)",
+    )
+    th_group.add_argument(
+        "--g-std-jinking", type=float, default=1.0,
+        help="Jinking 判定 g_load_std 閾値 (G, default: 1.0)",
+    )
+    th_group.add_argument(
+        "--roll-std-jinking", type=float, default=15.0,
+        help="Jinking 判定 roll_std 閾値 (deg, default: 15.0)",
     )
 
     args = parser.parse_args()
@@ -337,9 +373,11 @@ def main():
         "altitude_slope_threshold": args.altitude_slope_th,
         "altitude_slope_steep": args.altitude_slope_steep,
         "speed_delta_threshold": args.speed_delta_th,
-        "speed_loss_highg": args.speed_loss_highg,
+        "g_load_high_g": args.g_load_high_g,
+        "g_load_unloaded": args.g_load_unloaded,
+        "g_load_zoom": args.g_load_zoom,
+        "g_load_std_jinking": args.g_std_jinking,
         "roll_std_jinking": args.roll_std_jinking,
-        "heading_std_jinking": args.heading_std_jinking,
     }
 
     run_pipeline(
@@ -351,6 +389,8 @@ def main():
         thresholds=thresholds,
         annotate_acmi=not args.no_annotate_acmi,
         annotated_acmi_path=args.annotated_acmi_output,
+        model_type=args.model_type,
+        use_gpu=args.use_gpu,
     )
 
 

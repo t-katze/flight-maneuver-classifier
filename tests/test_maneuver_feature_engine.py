@@ -36,6 +36,7 @@ def _make_simple_df(n=50, dt=0.1):
         "heading": np.linspace(0, 30, n),             # 右旋回
         "pitch": np.full(n, 5.0),
         "roll": np.full(n, 15.0),
+        "g_load": np.full(n, 1.2),
     })
 
 
@@ -80,7 +81,7 @@ class TestAircraftFiltering:
 
 class TestPreprocessTimeseries:
     def test_empty_df(self):
-        df = pd.DataFrame(columns=["time", "altitude", "speed", "heading", "pitch", "roll"])
+        df = pd.DataFrame(columns=["time", "altitude", "speed", "heading", "pitch", "roll", "g_load"])
         result = preprocess_timeseries(df)
         assert result.empty
 
@@ -93,6 +94,7 @@ class TestPreprocessTimeseries:
             "heading": [350.0, 355.0, 0.0, 5.0],    # 360→0 跨ぎ
             "pitch": [0] * 4,
             "roll": [0] * 4,
+            "g_load": [1.0] * 4,
         })
         result = preprocess_timeseries(df)
         # unwrap 後は単調増加になるはず
@@ -111,10 +113,12 @@ class TestPreprocessTimeseries:
             "heading": [90] * 4,
             "pitch": [0] * 4,
             "roll": [0] * 4,
+            "g_load": [1.0, np.nan, 2.0, 2.5],
         })
         result = preprocess_timeseries(df)
         assert not result["altitude"].isna().any()
         assert not result["speed"].isna().any()
+        assert not result["g_load"].isna().any()
         # 中間値は線形補間
         assert abs(result.iloc[1]["altitude"] - 5100) < 1
 
@@ -127,6 +131,7 @@ class TestPreprocessTimeseries:
             "heading": [90] * 3,
             "pitch": [0] * 3,
             "roll": [0] * 3,
+            "g_load": [1.0] * 3,
         })
         result = preprocess_timeseries(df)
         assert list(result["time"]) == [0.0, 1.0, 2.0]
@@ -152,6 +157,14 @@ class TestExtractWindowFeatures:
         for col in FEATURE_COLUMNS:
             assert col in result.columns, f"Missing column: {col}"
 
+    def test_g_load_feature_columns_present(self):
+        df = _make_simple_df(n=100, dt=0.1)
+        result = extract_window_features(df, window_sec=5.0, step_sec=1.0)
+
+        for col in ["g_load_mean", "g_load_std", "g_load_delta", "g_load_slope"]:
+            assert col in FEATURE_COLUMNS
+            assert col in result.columns
+
     def test_window_start_end(self):
         """window_start / window_end が正しい"""
         df = _make_simple_df(n=100, dt=0.1)
@@ -174,7 +187,7 @@ class TestExtractWindowFeatures:
 
     def test_empty_df(self):
         """空の DataFrame は空の結果"""
-        df = pd.DataFrame(columns=["time", "altitude", "speed", "heading", "pitch", "roll"])
+        df = pd.DataFrame(columns=["time", "altitude", "speed", "heading", "pitch", "roll", "g_load"])
         result = extract_window_features(df, window_sec=5.0, step_sec=1.0)
         assert result.empty
 
@@ -187,6 +200,7 @@ class TestExtractWindowFeatures:
             "heading": [90],
             "pitch": [0],
             "roll": [0],
+            "g_load": [1.0],
         })
         result = extract_window_features(df, window_sec=5.0, step_sec=1.0)
         assert result.empty
@@ -200,6 +214,7 @@ class TestExtractWindowFeatures:
             "heading": [90, 91, 92],
             "pitch": [5, 5, 5],
             "roll": [0, 0, 0],
+            "g_load": [1.0, 1.1, 1.2],
         })
         result = extract_window_features(df, window_sec=5.0, step_sec=1.0)
         assert len(result) >= 1
@@ -214,6 +229,7 @@ class TestExtractWindowFeatures:
             "heading": np.full(n, 90.0),
             "pitch": np.full(n, 0.0),
             "roll": np.full(n, 0.0),
+            "g_load": np.full(n, 1.0),
         })
         result = extract_window_features(df, window_sec=5.0, step_sec=1.0)
         assert all(result["heading_std"] < 0.01)

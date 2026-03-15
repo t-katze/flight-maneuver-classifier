@@ -4,7 +4,7 @@ Tacview ACMI ログから航空機の機動を分類し、学習、推論、Tacv
 
 このリポジトリでは次の 3 つの用途をカバーします。
 
-- ACMI から特徴量を抽出し、ルールベース仮ラベルを付けて Random Forest を学習する
+- ACMI から特徴量を抽出し、ルールベース仮ラベルを付けて Random Forest または XGBoost を学習する
 - 学習済みモデルを別の ACMI に適用し、機動ラベルを推論する
 - 推論結果とルールベース仮ラベルを Tacview の Raw Telemetry に書き戻す
 
@@ -21,7 +21,7 @@ flowchart LR
     C --> D["前処理\nsort / unwrap / interpolate"]
     D --> E["5秒窓特徴量抽出"]
     E --> F["ルールベース仮ラベル"]
-    F --> G["Random Forest 学習 または 推論"]
+    F --> G["Random Forest / XGBoost 学習 または 推論"]
     G --> H["CSV 出力"]
     H --> I["ACMI 注釈書き戻し"]
 ```
@@ -62,6 +62,7 @@ flowchart LR
 - `heading`
 - `pitch`
 - `roll`
+- `g_load`
 
 実装: `frames_to_aircraft_df()`
 
@@ -82,12 +83,12 @@ flowchart LR
 
 デフォルトでは 5 秒窓、1 秒ステップです。
 
-各窓で次の 23 特徴量を抽出します。
+各窓で次の 27 特徴量を抽出します。
 
-- 平均: `altitude_mean`, `speed_mean`, `heading_mean`, `pitch_mean`, `roll_mean`
-- 標準偏差: `altitude_std`, `speed_std`, `heading_std`, `pitch_std`, `roll_std`
-- 始端終端差: `altitude_delta`, `speed_delta`, `heading_delta`, `pitch_delta`, `roll_delta`
-- 線形傾き: `altitude_slope`, `speed_slope`, `heading_slope`, `pitch_slope`, `roll_slope`
+- 平均: `altitude_mean`, `speed_mean`, `heading_mean`, `pitch_mean`, `roll_mean`, `g_load_mean`
+- 標準偏差: `altitude_std`, `speed_std`, `heading_std`, `pitch_std`, `roll_std`, `g_load_std`
+- 始端終端差: `altitude_delta`, `speed_delta`, `heading_delta`, `pitch_delta`, `roll_delta`, `g_load_delta`
+- 線形傾き: `altitude_slope`, `speed_slope`, `heading_slope`, `pitch_slope`, `roll_slope`, `g_load_slope`
 - 派生特徴量: `altitude_rate`, `heading_rate`, `roll_abs_mean`
 
 実装: `extract_window_features()`
@@ -119,30 +120,68 @@ flowchart LR
 - `roll_std`
 - `pitch_mean`
 
-優先順位は高いほうから順に次です。
+実際の判定は `ManeuverLabeler.label_single()` の `if` を上から順に評価します。つまり、下のほうの条件に当てはまっていても、上位条件に先にマッチした時点でそのラベルになります。
 
-1. Jinking
-2. Reversal
-3. Dive
-4. Zoom Climb
-5. High-G Turn
-6. Climbing Turn
-7. Descending Turn
-8. Level Turn
-9. Steady Climb
-10. Steady Descent
-11. Extension
-12. Acceleration
-13. Deceleration
-14. Straight & Level
+優先順位と判定条件は次です。
+
+1. `Jinking`
+   `roll_std > roll_std_jinking` かつ `heading_std > heading_std_jinking`
+2. `Reversal`
+   `abs(heading_delta) >= heading_reversal_threshold`
+3. `Dive`
+   `pitch_mean < pitch_dive_threshold` かつ `altitude_slope < -altitude_slope_steep` かつ `speed_delta > 0`
+4. `Zoom Climb`
+   `pitch_mean > pitch_zoom_threshold` かつ `altitude_slope > altitude_slope_steep` かつ `speed_delta < 0`
+5. `High-G Turn`
+   まず `abs(heading_delta) > heading_delta_threshold` を満たしたうえで、`speed_delta < -speed_loss_highg`
+6. `Climbing Turn`
+   旋回中で `altitude_slope > altitude_slope_threshold`
+7. `Descending Turn`
+   旋回中で `altitude_slope < -altitude_slope_threshold`
+8. `Level Turn`
+   旋回中で、上の旋回派生条件に当てはまらない
+9. `Steady Climb`
+   非旋回で `altitude_slope > altitude_slope_threshold`
+10. `Steady Descent`
+   非旋回で `altitude_slope < -altitude_slope_threshold`
+11. `Extension`
+   非旋回で `speed_delta > extension_speed_gain` かつ `altitude_slope < 0` かつ `altitude_slope >= -altitude_slope_threshold`
+12. `Acceleration`
+   `speed_delta > speed_delta_threshold`
+13. `Deceleration`
+   `speed_delta < -speed_delta_threshold`
+14. `Straight & Level`
+   上記どれにも当てはまらない場合のデフォルト
+
+補足:
+
+- 「旋回中」は `abs(heading_delta) > heading_delta_threshold` です。
+- `High-G Turn` は `Climbing Turn` や `Level Turn` より先に判定されます。
+- `Extension` は `Acceleration` より先に判定されるので、微降下しながら加速している直線飛行は `Acceleration` ではなく `Extension` になります。
+
+### ルールを変更したい場合
+
+変更箇所は目的ごとに分かれます。
+
+1. 閾値だけ変えたい
+   [maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py#L58) の `DEFAULT_THRESHOLDS` を修正します。
+2. 判定順や条件式を変えたい
+   [maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py#L120) の `label_single()` を修正します。ここがルールベース仮ラベルの本体です。
+3. クラス名やクラス ID を変えたい
+   [maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py#L35) の `MANEUVER_CLASSES` を修正します。
+
+注意点:
+
+- CLI から閾値を上書きできるので、コード側のデフォルトを変えるだけでは不十分です。CLI の既定値も揃えるなら [maneuver_main.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_main.py#L313)、[maneuver_train.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_train.py#L193)、[maneuver_predict.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_predict.py#L94) の引数デフォルトも更新してください。
+- クラス数やクラス ID を変えた場合は、既存モデルや既存 CSV との互換性が崩れます。再学習が必要です。
 
 実装: `src/maneuver_labeler.py`
 
-### 6. Random Forest 学習
+### 6. モデル学習
 
-仮ラベルを教師信号として Random Forest を学習します。
+仮ラベルを教師信号として `RandomForestClassifier` または `XGBClassifier` を学習します。
 
-設定:
+デフォルト設定:
 
 - `RandomForestClassifier`
 - `n_estimators=200`
@@ -150,6 +189,14 @@ flowchart LR
 - `min_samples_leaf=2`
 - `class_weight="balanced"`
 - `n_jobs=-1`
+
+GPU を使いたい場合は、`XGBoost` を選びます。
+
+- `--model-type xgboost`
+- `--use-gpu`
+
+この指定で `XGBClassifier(tree_method="hist", device="cuda")` を使います。  
+ただし、CUDA 対応 GPU と GPU 対応ビルドの `xgboost` が必要です。`Random Forest` では GPU は使いません。
 
 評価指標:
 
@@ -196,11 +243,13 @@ pip install -r requirements.txt
 
 ### 最初に知っておくこと
 
-- `maneuver_train.py` は「学習用データ作成 + モデル学習」を行うコマンドです。これだけでは注釈付き ACMI は出力しません。
+- `maneuver_train.py` は「学習用データ作成 + モデル学習」を行うコマンドです。
 - `maneuver_train.py` は学習完了後、デフォルトで入力に使った ACMI 群にも自動で予測を書き戻します。
+- 学習用の結合 CSV から 1 本の ACMI を直接生成するのではなく、入力 ACMI ごとに個別の注釈付き ACMI を出力します。
 - 学習済みモデルを別の ACMI に適用したい場合は、学習後に `maneuver_predict.py` を実行します。
 - `maneuver_train.py` の評価用 `train/test` 分割は内部で自動実行されます。
 - この分割は ACMI ファイル単位ではなく、抽出されたウィンドウサンプル単位です。
+- GPU を使う場合は `--model-type xgboost --use-gpu` を付けます。`--use-gpu` 単独では意味がなく、`Random Forest` ではエラーになります。
 
 ### 1 本の ACMI を一括処理する
 
@@ -216,6 +265,19 @@ python src/maneuver_main.py Tacview/flight.zip.acmi --output-dir results/run1
 - `results/run1/confusion_matrix.png`
 - `results/run1/feature_importances.png`
 - `results/run1/<input>.maneuver.zip.acmi`
+
+GPU 学習を使う例:
+
+```bash
+. .venv/bin/activate
+python src/maneuver_main.py \
+  Tacview/flight.zip.acmi \
+  --model-type xgboost \
+  --use-gpu \
+  --output-dir results/run1_gpu
+```
+
+この場合のモデル出力名は `results/run1_gpu/maneuver_xgboost_model.joblib` です。
 
 ### 複数 ACMI をまとめて学習する
 
@@ -236,6 +298,20 @@ python src/maneuver_train.py \
 - `results/train_run/feature_importances.png`
 - `results/train_run/predictions/<acmi名>/maneuver_features_labeled.csv`
 - `results/train_run/predictions/<acmi名>/<acmi名>.maneuver.zip.acmi`
+
+GPU 学習を使う場合:
+
+```bash
+. .venv/bin/activate
+python src/maneuver_train.py \
+  Tacview \
+  --recursive \
+  --model-type xgboost \
+  --use-gpu \
+  --output-dir results/train_run_gpu
+```
+
+この場合のモデル出力名は `results/train_run_gpu/maneuver_xgboost_model.joblib` です。
 
 この CSV は複数 ACMI を結合した学習データです。`source_acmi` 列と `source_title` 列で由来を追えます。
 
@@ -275,8 +351,8 @@ python src/maneuver_train.py \
 1. 指定した ACMI 群から特徴量とルールベース仮ラベルを抽出
 2. それらを 1 つのデータセットに結合
 3. 窓サンプル単位で `train/test` に分割
-4. Random Forest を学習
-5. 学習済みモデルを `maneuver_rf_model.joblib` として保存
+4. 指定したモデルを学習
+5. 学習済みモデルを `maneuver_rf_model.joblib` または `maneuver_xgboost_model.joblib` として保存
 6. 入力に使った各 ACMI に対して予測結果を自動で書き戻し、`predictions/` 配下に保存
 
 つまり、`python src/maneuver_train.py Tacview --output-dir results/train_run` を実行しても、全データが `train` に入るわけではありません。結合後のデータセット全体から、一部が自動で `test` に回されます。
@@ -355,6 +431,8 @@ python src/maneuver_predict.py Tacview \
   --output-dir results/predict_run
 ```
 
+`--model` には `maneuver_rf_model.joblib` でも `maneuver_xgboost_model.joblib` でも指定できます。
+
 ### 既存 CSV から ACMI だけ書き戻す
 
 ```bash
@@ -377,6 +455,10 @@ python src/maneuver_acmi_export.py \
   特定機体だけ処理したいときに使用
 - `--output-dir`
   出力ディレクトリ
+- `--model-type`
+  学習に使う分類器。`random_forest` または `xgboost`
+- `--use-gpu`
+  `xgboost` 選択時に CUDA GPU を使う
 - `--recursive`
   ディレクトリ入力時にサブディレクトリも再帰的に探索する
 - `--no-annotate-inputs`
@@ -406,14 +488,14 @@ python src/maneuver_acmi_export.py \
 
 ## 再学習の考え方
 
-このプロジェクトの学習器は Random Forest です。追加データだけを使った継ぎ足し学習はしません。
+このプロジェクトの学習器は `Random Forest` または `XGBoost` ですが、どちらもこの実装では追加データだけを使った継ぎ足し学習はしません。
 
 新しい学習データを増やしたい場合は、次の運用になります。
 
 1. 新しい ACMI を収集する
 2. `maneuver_train.py` に過去の ACMI と新しい ACMI を全部渡す
 3. 毎回まとめて再学習する
-4. 新しく出た `maneuver_rf_model.joblib` を以後の推論で使う
+4. 新しく出た `maneuver_rf_model.joblib` または `maneuver_xgboost_model.joblib` を以後の推論で使う
 
 実務的には、学習に使った ACMI 群を固定して `results/train_run/` のようなディレクトリ単位で管理するのが安全です。
 
@@ -426,7 +508,7 @@ python src/maneuver_acmi_export.py \
 - `src/maneuver_labeler.py`
   14 クラスのルールベース仮ラベル
 - `src/maneuver_classifier.py`
-  Random Forest 学習、評価、モデル保存
+  Random Forest / XGBoost 学習、評価、モデル保存
 - `src/maneuver_pipeline.py`
   学習、推論で共通利用するパイプライン関数
 - `src/maneuver_main.py`

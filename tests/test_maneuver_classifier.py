@@ -112,6 +112,33 @@ class TestTrainAndEvaluate:
         assert "model" in result
         assert result["model"] is not None
 
+    def test_rejects_gpu_with_random_forest(self):
+        X, y = _generate_synthetic_data(n_per_class=20)
+
+        with pytest.raises(ValueError, match="GPU is not supported"):
+            train_and_evaluate(
+                X,
+                y,
+                FEATURE_COLUMNS,
+                model_type="random_forest",
+                use_gpu=True,
+            )
+
+    def test_supports_xgboost_cpu(self):
+        pytest.importorskip("xgboost")
+        X, y = _generate_synthetic_data(n_per_class=20)
+        result = train_and_evaluate(
+            X,
+            y,
+            FEATURE_COLUMNS,
+            model_type="xgboost",
+            use_gpu=False,
+        )
+
+        assert result["model_type"] == "xgboost"
+        assert result["use_gpu"] is False
+        assert 0.0 <= result["accuracy"] <= 1.0
+
     def test_save_plots(self):
         """output_dir 指定で画像が保存される"""
         X, y = _generate_synthetic_data(n_per_class=50)
@@ -144,3 +171,22 @@ class TestModelPersistence:
             y_pred_orig = model.predict(X[:10])
             y_pred_loaded = loaded_model.predict(X[:10])
             np.testing.assert_array_equal(y_pred_orig, y_pred_loaded)
+
+    def test_save_model_keeps_metadata(self):
+        X, y = _generate_synthetic_data(n_per_class=20)
+        result = train_and_evaluate(X, y, FEATURE_COLUMNS)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "test_model.joblib")
+            save_model(
+                result["model"],
+                FEATURE_COLUMNS,
+                path,
+                metadata={"model_type": "random_forest", "use_gpu": False},
+            )
+
+            import joblib
+
+            payload = joblib.load(path)
+            assert payload["model_type"] == "random_forest"
+            assert payload["use_gpu"] is False

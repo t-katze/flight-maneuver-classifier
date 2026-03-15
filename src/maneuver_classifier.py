@@ -1,8 +1,8 @@
 """
-Flight Maneuver Classifier — Random Forest 分類・評価
+Flight Maneuver Classifier — 分類・評価
 
 スライディングウィンドウ特徴量 + ルールベース仮ラベルを用いて
-Random Forest で航空機機動を6クラスに分類し、評価指標を出力する。
+Random Forest または XGBoost で航空機機動を分類し、評価指標を出力する。
 
 出力:
     - Accuracy, Precision, Recall, F1-score
@@ -29,9 +29,8 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
-from maneuver_labeler import CLASS_NAMES, MANEUVER_CLASSES
+from maneuver_labeler import MANEUVER_CLASSES
 
 
 # ============================================================
@@ -46,18 +45,22 @@ def train_and_evaluate(
     n_estimators: int = 200,
     random_state: int = 42,
     output_dir: str | None = None,
+    model_type: str = "random_forest",
+    use_gpu: bool = False,
 ) -> dict:
     """
-    Random Forest で機動分類モデルを学習し、評価結果を返す。
+    機動分類モデルを学習し、評価結果を返す。
 
     Args:
         X: 特徴量行列 (n_samples, n_features)
-        y: ラベル配列 (n_samples,)  int 0–5
+        y: ラベル配列 (n_samples,)  int ラベル
         feature_names: 特徴量名リスト
         test_size: テストデータ割合
         n_estimators: Random Forest のツリー数
         random_state: 乱数シード
         output_dir: 結果画像の保存先 (None なら保存しない)
+        model_type: "random_forest" or "xgboost"
+        use_gpu: True の場合、GPU 対応モデルで CUDA を使用
 
     Returns:
         評価結果の辞書:
@@ -72,17 +75,19 @@ def train_and_evaluate(
         X, y, test_size=test_size, random_state=random_state, stratify=y,
     )
 
-    print(f"[ManeuverClassifier] Train: {len(X_train)}, Test: {len(X_test)}")
+    print(
+        "[ManeuverClassifier] "
+        f"Train: {len(X_train)}, Test: {len(X_test)}, "
+        f"Model: {model_type}, GPU: {use_gpu}"
+    )
 
-    # ---- Random Forest 学習 ----
-    model = RandomForestClassifier(
+    # ---- 学習 ----
+    model = _build_model(
+        model_type=model_type,
         n_estimators=n_estimators,
-        max_depth=None,
-        min_samples_split=5,
-        min_samples_leaf=2,
         random_state=random_state,
-        n_jobs=-1,
-        class_weight="balanced",
+        use_gpu=use_gpu,
+        y=y_train,
     )
     model.fit(X_train, y_train)
 
@@ -108,7 +113,7 @@ def train_and_evaluate(
 
     # ---- コンソール出力 ----
     print(f"\n{'=' * 60}")
-    print("Random Forest — 機動分類結果")
+    print(f"{model_type} — 機動分類結果")
     print(f"{'=' * 60}")
     print(f"Accuracy:  {acc:.4f}")
     print(f"Precision: {prec:.4f} (weighted)")
@@ -140,10 +145,60 @@ def train_and_evaluate(
         "confusion_matrix": cm,
         "feature_importances": dict(zip(feature_names, importances.tolist())),
         "model": model,
+        "model_type": model_type,
+        "use_gpu": use_gpu,
         "X_test": X_test,
         "y_test": y_test,
         "y_pred": y_pred,
     }
+
+
+def _build_model(
+    model_type: str,
+    n_estimators: int,
+    random_state: int,
+    use_gpu: bool,
+    y: np.ndarray,
+):
+    if model_type == "random_forest":
+        if use_gpu:
+            raise ValueError("GPU is not supported with model_type='random_forest'.")
+        return RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=None,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight="balanced",
+        )
+
+    if model_type == "xgboost":
+        try:
+            from xgboost import XGBClassifier
+        except ImportError as exc:
+            raise ImportError(
+                "XGBoost is not installed. Run `pip install -r requirements.txt`."
+            ) from exc
+
+        params = {
+            "n_estimators": n_estimators,
+            "max_depth": 8,
+            "learning_rate": 0.1,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "objective": "multi:softmax",
+            "eval_metric": "mlogloss",
+            "random_state": random_state,
+            "n_jobs": -1,
+            "tree_method": "hist",
+            "num_class": int(np.max(y)) + 1,
+        }
+        if use_gpu:
+            params["device"] = "cuda"
+        return XGBClassifier(**params)
+
+    raise ValueError(f"Unsupported model_type: {model_type}")
 
 
 # ============================================================
@@ -187,7 +242,7 @@ def _save_plots(
     ax.set_yticks(range(n_show))
     ax.set_yticklabels(top_names[::-1])
     ax.set_xlabel("Feature Importance")
-    ax.set_title("Top Feature Importances — Random Forest")
+    ax.set_title("Top Feature Importances")
     fig.tight_layout()
     fig.savefig(out / "feature_importances.png", dpi=150)
     plt.close(fig)
@@ -198,16 +253,19 @@ def _save_plots(
 # モデル保存/読込
 # ============================================================
 
-def save_model(model, feature_names: list[str], path: str):
-    """Random Forest モデルを保存する。"""
+def save_model(model, feature_names: list[str], path: str, metadata: dict | None = None):
+    """学習済み分類モデルを保存する。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({
+    save_data = {
         "model": model,
         "feature_columns": feature_names,
         "task": "classification",
         "classes": MANEUVER_CLASSES,
-    }, path)
+    }
+    if metadata:
+        save_data.update(metadata)
+    joblib.dump(save_data, path)
     print(f"[ManeuverClassifier] Model saved → {path}")
 
 

@@ -1,27 +1,27 @@
 """
-Flight Maneuver Classifier — ルールベース仮ラベラー (14クラス版)
+Flight Maneuver Classifier — ルールベース仮ラベラー (14クラス / G-Load対応版)
 
 スライディングウィンドウ特徴量から、航空機の機動を14クラスに分類する
-ルールベースのラベラー。
+ルールベースのラベラー。G-Load を主要な判定基準として組み込む。
 
 クラス体系:
     基本飛行 (5):
-        0: Straight & Level  — 直線水平飛行
-        1: Acceleration       — 加速 (水平)
-        2: Deceleration       — 減速 (水平)
+        0: Straight & Level  — 直線水平飛行 (g ≈ 1)
+        1: Acceleration       — 加速 (水平, g ≈ 1)
+        2: Deceleration       — 減速 (水平, g ≈ 1)
         3: Steady Climb       — 定常上昇
         4: Steady Descent     — 定常降下
     旋回系 (4):
-        5: Level Turn         — 水平旋回
-        6: Climbing Turn      — 上昇旋回 (High Yo-Yo 的)
-        7: Descending Turn    — 降下旋回 (Low Yo-Yo 的)
-        8: High-G Turn        — 高G旋回 / ブレイクターン
+        5: Level Turn         — 水平旋回 (g ≈ 1.5–3)
+        6: Climbing Turn      — 上昇旋回 / High Yo-Yo
+        7: Descending Turn    — 降下旋回 / Low Yo-Yo
+        8: High-G Turn        — 高G旋回 / ブレイクターン (g > 4)
     戦術機動 (5):
-        9: Dive               — 急降下
-       10: Zoom Climb         — 急上昇 (ズームクライム)
+        9: Dive               — 急降下 (g < 1, unloaded)
+       10: Zoom Climb         — 急上昇 / ズームクライム (g > 2)
        11: Reversal           — 方向転換 (Split-S / Immelmann)
-       12: Jinking            — 回避機動 (不規則な変化)
-       13: Extension          — 離脱 / エネルギー回復
+       12: Jinking            — 回避機動 (g_load_std 大)
+       13: Extension          — 離脱 / エネルギー回復 (g ≈ 1)
 """
 
 import numpy as np
@@ -71,11 +71,16 @@ DEFAULT_THRESHOLDS = {
 
     # --- 速度変化判定 ---
     "speed_delta_threshold": 5.0,           # m/s: 加速/減速判定
-    "speed_loss_highg": 15.0,               # m/s: 高G旋回での速度損失
+
+    # --- G-Load 判定 ---
+    "g_load_high_g": 8.0,                   # G: これ以上で High-G Turn
+    "g_load_unloaded": 0.5,                 # G: これ以下で unloaded (Dive)
+    "g_load_zoom": 2.0,                     # G: これ以上で Zoom Climb の pull
+    "g_load_std_jinking": 1.0,              # G: g_load_std がこれ以上 → Jinking
+    "g_load_level": 1.5,                    # G: g_mean がこれ以下 → level 相当
 
     # --- ロール / ジンキング ---
-    "roll_std_jinking": 20.0,               # deg: roll_std がこれ以上 → ジンキング
-    "heading_std_jinking": 10.0,            # deg: heading_std がこれ以上 → ジンキング
+    "roll_std_jinking": 100.0,               # deg: roll_std がこれ以上でジンキング補助
 
     # --- Dive / Zoom ---
     "pitch_dive_threshold": -15.0,          # deg: pitch がこれ以下 → Dive
@@ -92,23 +97,29 @@ DEFAULT_THRESHOLDS = {
 
 class ManeuverLabeler:
     """
-    ルールベースで14クラスの機動ラベルを付与する。
+    ルールベースで14クラスの機動ラベルを付与する (G-Load 対応版)。
+
+    G-Load の活用方針:
+        - g_load_mean: 旋回荷重の強度（High-G Turn ≥ 4G, Level Turn ≈ 1.5–3G）
+        - g_load_std:  荷重の変動（大 → Jinking / 不規則な機動）
+        - g_load_mean < 1:  unloaded → Dive / pushover
+        - g_load_mean ≈ 1:  直線飛行系（Level, Accel, Decel, Extension）
 
     判定の優先度 (高→低):
-        1. Jinking         — roll_std & heading_std が大きい (不規則な回避機動)
-        2. Reversal        — |heading_delta| ≥ 120° (方向転換)
-        3. Dive            — pitch 大きく負 & altitude 急降下 & speed 増加
-        4. Zoom Climb      — pitch 大きく正 & altitude 急上昇 & speed 減少
-        5. High-G Turn     — heading 変化 大 & speed 大きく減少
+        1. Jinking         — g_load_std 大 & (roll_std 大 or heading_std 大)
+        2. Reversal        — |heading_delta| ≥ 120°
+        3. High-G Turn     — g_load_mean ≥ 4G & heading 変化
+        4. Dive            — pitch 大きく負 & g < 1 (unloaded) & altitude 急降下
+        5. Zoom Climb      — pitch 大きく正 & g ≥ 2 & altitude 急上昇
         6. Climbing Turn   — heading 変化 & altitude 上昇
         7. Descending Turn — heading 変化 & altitude 降下
         8. Level Turn      — heading 変化 & altitude 概ねフラット
         9. Steady Climb    — altitude 上昇 (旋回なし)
        10. Steady Descent  — altitude 降下 (旋回なし)
-       11. Extension       — speed 増加 & 直線 & altitude フラット～微降下
-       12. Acceleration    — speed 増加 & 直線 & altitude フラット
-       13. Deceleration    — speed 減少 & 直線 & altitude フラット
-       14. Straight & Level — デフォルト
+       11. Extension       — speed 増加 & 直線 & 微降下 & g ≈ 1
+       12. Acceleration    — speed 増加
+       13. Deceleration    — speed 減少
+       14. Straight & Level — デフォルト (g ≈ 1)
     """
 
     def __init__(self, thresholds: dict | None = None):
@@ -121,8 +132,9 @@ class ManeuverLabeler:
         1窓分の特徴量からクラスID (0–13) を返す。
 
         使用する特徴量:
-            heading_delta, heading_std, altitude_slope, altitude_delta,
-            speed_delta, speed_slope, roll_std, pitch_mean
+            heading_delta, heading_std, altitude_slope,
+            speed_delta, roll_std, pitch_mean,
+            g_load_mean, g_load_std
         """
         heading_delta = row.get("heading_delta", 0.0)
         heading_std = row.get("heading_std", 0.0)
@@ -130,39 +142,43 @@ class ManeuverLabeler:
         speed_delta = row.get("speed_delta", 0.0)
         roll_std = row.get("roll_std", 0.0)
         pitch_mean = row.get("pitch_mean", 0.0)
+        g_mean = row.get("g_load_mean", 1.0)
+        g_std = row.get("g_load_std", 0.0)
 
         abs_heading_delta = abs(heading_delta)
         th = self.thresholds
 
-        # ---- 1. Jinking: 非常に不規則な動き ----
-        if (roll_std > th["roll_std_jinking"]
-                and heading_std > th["heading_std_jinking"]):
+        # ---- 1. Jinking: G荷重が不規則に変動 + 姿勢も不安定 ----
+        if (g_std > th["g_load_std_jinking"]
+                and (roll_std > th["roll_std_jinking"]
+                     or heading_std > th["heading_delta_threshold"] * 2)):
             return 12  # Jinking
 
         # ---- 2. Reversal: 大きな方向転換 ----
         if abs_heading_delta >= th["heading_reversal_threshold"]:
             return 11  # Reversal
 
-        # ---- 3. Dive: 急降下 ----
-        if (pitch_mean < th["pitch_dive_threshold"]
-                and altitude_slope < -th["altitude_slope_steep"]
-                and speed_delta > 0):
+        # ---- 3. High-G Turn: 高荷重 + heading 変化 ----
+        if (g_mean >= th["g_load_high_g"]
+                and abs_heading_delta > th["heading_delta_threshold"]):
+            return 8  # High-G Turn
+
+        # ---- 4. Dive: unloaded, pitch 負, altitude 急降下 ----
+        if (g_mean < th["g_load_unloaded"]
+                and pitch_mean < th["pitch_dive_threshold"]
+                and altitude_slope < -th["altitude_slope_steep"]):
             return 9  # Dive
 
-        # ---- 4. Zoom Climb: 急上昇 ----
-        if (pitch_mean > th["pitch_zoom_threshold"]
-                and altitude_slope > th["altitude_slope_steep"]
-                and speed_delta < 0):
+        # ---- 5. Zoom Climb: 高G pull, pitch 正, altitude 急上昇 ----
+        if (g_mean >= th["g_load_zoom"]
+                and pitch_mean > th["pitch_zoom_threshold"]
+                and altitude_slope > th["altitude_slope_steep"]):
             return 10  # Zoom Climb
 
         # ---- 旋回系 (heading_delta が閾値以上) ----
         is_turning = abs_heading_delta > th["heading_delta_threshold"]
 
         if is_turning:
-            # 5. High-G Turn: 旋回 + 大きな速度損失
-            if speed_delta < -th["speed_loss_highg"]:
-                return 8  # High-G Turn
-
             # 6. Climbing Turn: 旋回 + 上昇
             if altitude_slope > th["altitude_slope_threshold"]:
                 return 6  # Climbing Turn
@@ -184,15 +200,15 @@ class ManeuverLabeler:
             return 4  # Steady Descent
 
         # ---- 非旋回・水平・速度変化 ----
-        # 11. Extension: 速度増加 + 直線 + 微降下 (離脱/エネルギー回復)
-        #     altitude_slope が 0 未満 (微降下) だが急降下ではない場合
+        # 11. Extension: 速度増加 + 直線 + 微降下 + 低G (離脱)
         if (speed_delta > th["extension_speed_gain"]
                 and abs_heading_delta <= th["heading_delta_threshold"]
                 and altitude_slope < 0
-                and altitude_slope >= -th["altitude_slope_threshold"]):
+                and altitude_slope >= -th["altitude_slope_threshold"]
+                and g_mean < th["g_load_level"]):
             return 13  # Extension
 
-        # 12. Acceleration: 速度増加 + 直線 + 水平〜微上昇
+        # 12. Acceleration: 速度増加
         if speed_delta > th["speed_delta_threshold"]:
             return 1  # Acceleration
 
