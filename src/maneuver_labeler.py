@@ -62,32 +62,32 @@ NUM_CLASSES = len(MANEUVER_CLASSES)
 
 DEFAULT_THRESHOLDS = {
     # --- 旋回判定 ---
-    "heading_delta_threshold": 5.0,         # deg: これ以上で「旋回」
-    "heading_reversal_threshold": 120.0,    # deg: これ以上で「方向転換」
+    "heading_delta_threshold": 5.0,         # [deg]   これ以上で「旋回」
+    "heading_reversal_threshold": 120.0,    # [deg]   これ以上で「方向転換」
 
     # --- 高度変化判定 ---
-    "altitude_slope_threshold": 2.0,        # m/s: 上昇/降下判定
-    "altitude_slope_steep": 10.0,           # m/s: 急降下/急上昇判定
+    "altitude_slope_threshold": 2.0,        # [m/s]   上昇/降下判定
+    "altitude_slope_steep": 10.0,           # [m/s]   急降下/急上昇判定
 
     # --- 速度変化判定 ---
-    "speed_delta_threshold": 5.0,           # m/s: 加速/減速判定
+    "speed_delta_threshold": 5.0,           # [m/s]   加速/減速判定
 
     # --- G-Load 判定 ---
-    "g_load_high_g": 8.0,                   # G: これ以上で High-G Turn
-    "g_load_unloaded": 0.5,                 # G: これ以下で unloaded (Dive)
-    "g_load_zoom": 2.0,                     # G: これ以上で Zoom Climb の pull
-    "g_load_std_jinking": 1.0,              # G: g_load_std がこれ以上 → Jinking
-    "g_load_level": 1.5,                    # G: g_mean がこれ以下 → level 相当
+    "g_load_high_g": 7.0,                   # [G]     これ以上で High-G Turn
+    "g_load_unloaded": 0.5,                 # [G]     これ以下で unloaded (Dive)
+    "g_load_zoom": 2.0,                     # [G]     これ以上で Zoom Climb の pull
+    "g_load_std_jinking": 1.0,              # [G]     g_load_std がこれ以上 → Jinking
+    "g_load_level": 1.5,                    # [G]     g_mean がこれ以下 → level 相当
 
     # --- ロール / ジンキング ---
-    "roll_std_jinking": 100.0,               # deg: roll_std がこれ以上でジンキング補助
+    "roll_std_jinking": 50.0,              # [deg]   roll_std がこれ以上でジンキング補助
 
     # --- Dive / Zoom ---
-    "pitch_dive_threshold": -15.0,          # deg: pitch がこれ以下 → Dive
-    "pitch_zoom_threshold": 15.0,           # deg: pitch がこれ以上 → Zoom Climb
+    "pitch_dive_threshold": -15.0,          # [deg]   pitch がこれ以下 → Dive
+    "pitch_zoom_threshold": 15.0,           # [deg]   pitch がこれ以上 → Zoom Climb
 
     # --- Extension ---
-    "extension_speed_gain": 5.0,            # m/s: speed 増加
+    "extension_speed_gain": 5.0,            # [m/s]   speed 増加
 }
 
 
