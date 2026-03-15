@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from maneuver_acmi_export import annotate_acmi_file
 from maneuver_classifier import load_model
+from maneuver_labeler import add_threshold_arguments, thresholds_from_args
 from maneuver_pipeline import (
     acmi_output_stem,
     add_model_predictions,
@@ -26,7 +27,7 @@ def predict_for_acmi_files(
     acmi_paths: list[str],
     model_path: str,
     window_sec: float = 5.0,
-    step_sec: float = 1.0,
+    step_sec: float = 2.5,
     output_dir: str = "results/predict",
     aircraft_filter: str | None = None,
     thresholds: dict | None = None,
@@ -91,7 +92,7 @@ def main():
     )
     parser.add_argument("--model", required=True, help="Trained maneuver model (.joblib)")
     parser.add_argument("--window", type=float, default=5.0)
-    parser.add_argument("--step", type=float, default=1.0)
+    parser.add_argument("--step", type=float, default=2.5)
     parser.add_argument("--output-dir", default="results/predict")
     parser.add_argument("--aircraft-id", default=None)
     parser.add_argument(
@@ -100,27 +101,10 @@ def main():
         help="ディレクトリ入力時にサブディレクトリも再帰的に探索する",
     )
 
-    th_group = parser.add_argument_group("ラベラー閾値")
-    th_group.add_argument("--heading-delta-th", type=float, default=5.0)
-    th_group.add_argument("--heading-reversal-th", type=float, default=120.0)
-    th_group.add_argument("--altitude-slope-th", type=float, default=2.0)
-    th_group.add_argument("--altitude-slope-steep", type=float, default=10.0)
-    th_group.add_argument("--speed-delta-th", type=float, default=5.0)
-    th_group.add_argument("--speed-loss-highg", type=float, default=15.0)
-    th_group.add_argument("--roll-std-jinking", type=float, default=20.0)
-    th_group.add_argument("--heading-std-jinking", type=float, default=10.0)
+    add_threshold_arguments(parser)
 
     args = parser.parse_args()
-    thresholds = {
-        "heading_delta_threshold": args.heading_delta_th,
-        "heading_reversal_threshold": args.heading_reversal_th,
-        "altitude_slope_threshold": args.altitude_slope_th,
-        "altitude_slope_steep": args.altitude_slope_steep,
-        "speed_delta_threshold": args.speed_delta_th,
-        "speed_loss_highg": args.speed_loss_highg,
-        "roll_std_jinking": args.roll_std_jinking,
-        "heading_std_jinking": args.heading_std_jinking,
-    }
+    thresholds = thresholds_from_args(args)
 
     predict_for_acmi_files(
         acmi_paths=args.acmi_files,

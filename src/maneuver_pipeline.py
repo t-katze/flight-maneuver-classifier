@@ -74,7 +74,7 @@ def save_labeled_dataframe(df: pd.DataFrame, path: str) -> str:
 def extract_labeled_features_from_acmi(
     acmi_path: str,
     window_sec: float = 5.0,
-    step_sec: float = 1.0,
+    step_sec: float = 2.5,
     aircraft_filter: str | None = None,
     thresholds: dict | None = None,
     verbose: bool = True,
@@ -138,7 +138,7 @@ def extract_labeled_features_from_acmi(
 def build_combined_labeled_dataset(
     acmi_paths: list[str],
     window_sec: float = 5.0,
-    step_sec: float = 1.0,
+    step_sec: float = 2.5,
     aircraft_filter: str | None = None,
     thresholds: dict | None = None,
     verbose: bool = True,

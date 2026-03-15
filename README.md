@@ -1,548 +1,451 @@
 # Flight Maneuver Classifier
 
-Tacview ACMI ログから航空機の機動を分類し、学習、推論、Tacview への書き戻しまで行うためのツール群です。
+Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間窓ごとに機動ラベルを付与して学習・推論・Tacview 注釈書き戻しを行うツール群です。
 
-このリポジトリでは次の 3 つの用途をカバーします。
+この README は、現在のコード実装を「短時間窓ベース航空機機動ラベリング仕様書・設計書」に対応づけて説明します。
 
-- ACMI から特徴量を抽出し、ルールベース仮ラベルを付けて Random Forest または XGBoost を学習する
-- 学習済みモデルを別の ACMI に適用し、機動ラベルを推論する
-- 推論結果とルールベース仮ラベルを Tacview の Raw Telemetry に書き戻す
+## 概要
 
-現在の実装は `Type=Air+FixedWing` のオブジェクトだけを解析対象にします。
+このプロジェクトは次の処理を行います。
 
-## 全体像
+1. ACMI から `Air+FixedWing` のみを抽出
+2. 単機時系列を構築
+3. 前処理、リサンプリング、平滑化
+4. 5 秒窓ごとの特徴量抽出
+5. 5 秒主窓の中で 2 秒補助窓の短周期特徴も抽出
+6. ルールベース主ラベル・属性ラベル付与
+7. そのラベルを教師信号として分類モデルを学習
+8. 推論結果を CSV と Tacview Raw Telemetry に出力
 
-処理パイプラインは次のとおりです。
+## 設計方針
 
-```mermaid
-flowchart LR
-    A["Tacview ACMI"] --> B["ACMIParser"]
-    B --> C["機体ごとの時系列"]
-    C --> D["前処理\nsort / unwrap / interpolate"]
-    D --> E["5秒窓特徴量抽出"]
-    E --> F["ルールベース仮ラベル"]
-    F --> G["Random Forest / XGBoost 学習 または 推論"]
-    G --> H["CSV 出力"]
-    H --> I["ACMI 注釈書き戻し"]
-```
+本実装は単機運動学だけを使います。
 
-## 主なスクリプト
+- 相手機との相対幾何は使いません
+- BFM 戦術そのものではなく、観測可能な運動形態を扱います
+- 1 窓につき主ラベルは 1 つだけ付与します
+- 補助属性ラベルは複数同時に付与できます
+- `Reversal` や `Extension` のような戦術語は主ラベルに使いません
+- `Transition` と `Uncertain` を導入し、無理な一意分類を避けます
 
-- `src/maneuver_main.py`
-  1 本の ACMI を対象に、特徴量抽出、ルールベース仮ラベル、学習、評価、注釈付き ACMI 出力まで一括で実行します。
-- `src/maneuver_train.py`
-  複数の ACMI をまとめて学習データ化し、1 つのモデルを学習します。
-- `src/maneuver_predict.py`
-  学習済みモデルを 1 本以上の ACMI に適用し、推論結果を CSV と注釈付き ACMI に出力します。
-- `src/maneuver_acmi_export.py`
-  既存のラベル付き CSV から注釈付き ACMI を生成します。
+## ラベル体系
 
-## アルゴリズム
+### 主ラベル
 
-### 1. 対象機体の抽出
+| ID | Label |
+| --- | --- |
+| 0 | `Straight_Level` |
+| 1 | `Straight_Climb` |
+| 2 | `Straight_Descent` |
+| 3 | `Level_Turn` |
+| 4 | `Climbing_Turn` |
+| 5 | `Descending_Turn` |
+| 6 | `Dive` |
+| 7 | `Zoom_Climb` |
+| 8 | `Large_Heading_Change` |
+| 9 | `Oscillatory_Maneuver` |
+| 10 | `Transition` |
+| 11 | `Uncertain` |
 
-解析対象は `Type=Air+FixedWing` のみです。
+### 補助属性ラベル
 
-- 艦船
-- 地上ユニット
-- `Aircraft` のような曖昧な型
-- `Air+Refueling` など `Air+FixedWing` 以外の型
+- `High_G`
+- `Unloaded`
+- `Accelerating`
+- `Decelerating`
+- `High_Roll_Rate`
+- `High_Turn_Rate`
+- `Rapid_Altitude_Change`
+- `Heading_Reversal_Like`
+- `Jinking_Like`
 
-は機動分類の対象外です。
+### 主ラベル優先順位
 
-実装: `src/maneuver_feature_engine.py`
+1. `Uncertain`
+2. `Transition`
+3. `Oscillatory_Maneuver`
+4. `Large_Heading_Change`
+5. `Dive`
+6. `Zoom_Climb`
+7. `Climbing_Turn`
+8. `Descending_Turn`
+9. `Level_Turn`
+10. `Straight_Climb`
+11. `Straight_Descent`
+12. `Straight_Level`
 
-### 2. 時系列の構築
+## 入力仕様
 
-各機体について ACMI フレーム列から次の時系列を作ります。
+### 必須入力
 
 - `time`
 - `altitude`
 - `speed`
-- `heading`
 - `pitch`
 - `roll`
+- `heading`
 - `g_load`
 
-実装: `frames_to_aircraft_df()`
+### 任意入力
 
-### 3. 前処理
+コードは入力として直接は要求しませんが、内部で次を導出して使います。
 
-前処理では次を行います。
+- `vertical_speed`
+- `roll_rate`
+- `pitch_rate`
+- `turn_rate`
 
-- 時刻順ソート
-- `heading` と `roll` の `np.unwrap` による角度連続化
-- 欠損値の線形補間
-- 補間後も残る欠損の前方埋め、後方埋め
+### 単位
 
-これにより 0°/360° 境界やログ欠損に起因する不連続を減らします。
+前提は次の通りです。
 
-実装: `preprocess_timeseries()`
+- `time`: 秒
+- `altitude`: m
+- `speed`: m/s
+- `pitch`, `roll`, `heading`: deg
+- `g_load`: G
 
-### 4. スライディングウィンドウ特徴量
+## 時間窓仕様
 
-デフォルトでは 5 秒窓、1 秒ステップです。
+- 主ラベル判定窓: 5 秒
+- 補助短窓: 2 秒
+- デフォルトステップ: 2.5 秒
+- オーバーラップ: 50%
+- リサンプリング周波数: 5 Hz
 
-各窓で次の 27 特徴量を抽出します。
+仕様書にある 10 Hz / 5 Hz のうち、現実装は 5 Hz を採用しています。
+短周期の揺れに敏感な `Oscillatory_Maneuver` と `Jinking_Like` には、5 秒主窓の内部で 2 秒補助窓を走査した特徴を使います。
 
-- 平均: `altitude_mean`, `speed_mean`, `heading_mean`, `pitch_mean`, `roll_mean`, `g_load_mean`
-- 標準偏差: `altitude_std`, `speed_std`, `heading_std`, `pitch_std`, `roll_std`, `g_load_std`
-- 始端終端差: `altitude_delta`, `speed_delta`, `heading_delta`, `pitch_delta`, `roll_delta`, `g_load_delta`
-- 線形傾き: `altitude_slope`, `speed_slope`, `heading_slope`, `pitch_slope`, `roll_slope`, `g_load_slope`
-- 派生特徴量: `altitude_rate`, `heading_rate`, `roll_abs_mean`
+## 前処理仕様
 
-実装: `extract_window_features()`
+[src/maneuver_feature_engine.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_feature_engine.py) で次を実施します。
 
-### 5. ルールベース仮ラベル
+1. 時刻順ソート
+2. `heading` と `roll` の unwrap
+3. 欠損を含む数値列の補間
+4. 5 Hz への等間隔リサンプリング
+5. 移動平均による平滑化
+6. `heading_rate`, `roll_rate`, `pitch_rate`, `vertical_speed` の導出
+7. 長い欠損区間の比率と、物理的に不自然な値の検出
 
-教師ラベルが明示的にないため、まずルールベースで仮ラベルを付けます。現在は 14 クラスです。
+## 特徴量仕様
 
-- `0`: Straight & Level
-- `1`: Acceleration
-- `2`: Deceleration
-- `3`: Steady Climb
-- `4`: Steady Descent
-- `5`: Level Turn
-- `6`: Climbing Turn
-- `7`: Descending Turn
-- `8`: High-G Turn
-- `9`: Dive
-- `10`: Zoom Climb
-- `11`: Reversal
-- `12`: Jinking
-- `13`: Extension
+各 5 秒窓で、主に次の特徴量を計算します。
 
-判定に使う主な特徴量は次です。
+### 基本特徴量
 
-- `heading_delta`, `heading_std`
-- `altitude_slope`
+- `speed_mean`
 - `speed_delta`
-- `roll_std`
+- `speed_slope`
+- `alt_mean`
+- `alt_delta`
+- `alt_slope`
 - `pitch_mean`
+- `roll_mean`
+- `g_mean`
+- `g_std`
 
-実際の判定は `ManeuverLabeler.label_single()` の `if` を上から順に評価します。つまり、下のほうの条件に当てはまっていても、上位条件に先にマッチした時点でそのラベルになります。
+### 微分特徴量
 
-優先順位と判定条件は次です。
+- `turn_rate_mean`
+- `turn_rate_peak`
+- `roll_rate_mean`
+- `roll_rate_peak`
+- `pitch_rate_mean`
+- `vertical_speed_mean`
+- `vertical_speed_peak`
 
-1. `Jinking`
-   `roll_std > roll_std_jinking` かつ `heading_std > heading_std_jinking`
-2. `Reversal`
-   `abs(heading_delta) >= heading_reversal_threshold`
-3. `Dive`
-   `pitch_mean < pitch_dive_threshold` かつ `altitude_slope < -altitude_slope_steep` かつ `speed_delta > 0`
-4. `Zoom Climb`
-   `pitch_mean > pitch_zoom_threshold` かつ `altitude_slope > altitude_slope_steep` かつ `speed_delta < 0`
-5. `High-G Turn`
-   まず `abs(heading_delta) > heading_delta_threshold` を満たしたうえで、`speed_delta < -speed_loss_highg`
-6. `Climbing Turn`
-   旋回中で `altitude_slope > altitude_slope_threshold`
-7. `Descending Turn`
-   旋回中で `altitude_slope < -altitude_slope_threshold`
-8. `Level Turn`
-   旋回中で、上の旋回派生条件に当てはまらない
-9. `Steady Climb`
-   非旋回で `altitude_slope > altitude_slope_threshold`
-10. `Steady Descent`
-   非旋回で `altitude_slope < -altitude_slope_threshold`
-11. `Extension`
-   非旋回で `speed_delta > extension_speed_gain` かつ `altitude_slope < 0` かつ `altitude_slope >= -altitude_slope_threshold`
-12. `Acceleration`
-   `speed_delta > speed_delta_threshold`
-13. `Deceleration`
-   `speed_delta < -speed_delta_threshold`
-14. `Straight & Level`
-   上記どれにも当てはまらない場合のデフォルト
+### 方位変化・振動特徴量
 
-補足:
+- `heading_delta`
+- `turn_sign_changes`
+- `roll_sign_changes`
+- `pitch_sign_changes`
+- `alt_residual_std`
 
-- 「旋回中」は `abs(heading_delta) > heading_delta_threshold` です。
-- `High-G Turn` は `Climbing Turn` や `Level Turn` より先に判定されます。
-- `Extension` は `Acceleration` より先に判定されるので、微降下しながら加速している直線飛行は `Acceleration` ではなく `Extension` になります。
+### 補助派生特徴量
 
-### ルールを変更したい場合
+- `dive_score_raw`
+- `zoom_score_raw`
+- `straightness_score`
+- `turn_dominance`
 
-変更箇所は目的ごとに分かれます。
+### `Transition` / `Uncertain` 判定補助
 
-1. 閾値だけ変えたい
-   [maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py#L58) の `DEFAULT_THRESHOLDS` を修正します。
-2. 判定順や条件式を変えたい
-   [maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py#L120) の `label_single()` を修正します。ここがルールベース仮ラベルの本体です。
-3. クラス名やクラス ID を変えたい
-   [maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py#L35) の `MANEUVER_CLASSES` を修正します。
+- `first_half_turn_rate_mean`
+- `second_half_turn_rate_mean`
+- `first_half_vertical_speed_mean`
+- `second_half_vertical_speed_mean`
+- `first_half_pitch_mean`
+- `second_half_pitch_mean`
+- `first_half_heading_delta`
+- `second_half_heading_delta`
+- `missing_ratio`
+- `long_gap_ratio`
+- `sensor_conflict`
+- `feature_out_of_range`
 
-注意点:
+### 2 秒補助窓特徴量
 
-- CLI から閾値を上書きできるので、コード側のデフォルトを変えるだけでは不十分です。CLI の既定値も揃えるなら [maneuver_main.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_main.py#L313)、[maneuver_train.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_train.py#L193)、[maneuver_predict.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_predict.py#L94) の引数デフォルトも更新してください。
-- クラス数やクラス ID を変えた場合は、既存モデルや既存 CSV との互換性が崩れます。再学習が必要です。
+5 秒主窓の内部で 2 秒サブ窓を走査し、短周期検出用に次を集約します。
 
-実装: `src/maneuver_labeler.py`
+- `short_window_count`
+- `short_turn_sign_changes_max`
+- `short_roll_sign_changes_max`
+- `short_pitch_sign_changes_max`
+- `short_turn_rate_peak_max`
+- `short_roll_rate_peak_max`
+- `short_g_std_max`
 
-### 6. モデル学習
+## 閾値仕様
 
-仮ラベルを教師信号として `RandomForestClassifier` または `XGBClassifier` を学習します。
+主なデフォルト閾値は [src/maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py) の `DEFAULT_THRESHOLDS` にあります。
 
-デフォルト設定:
+| Key | Default |
+| --- | --- |
+| `turn_small` | `3.0 deg/s` |
+| `turn_large` | `10.0 deg/s` |
+| `turn_high` | `18.0 deg/s` |
+| `vs_small` | `5.0 m/s` |
+| `vs_up` | `10.0 m/s` |
+| `vs_down` | `10.0 m/s` |
+| `vs_rapid` | `30.0 m/s` |
+| `vs_rapid_up` | `30.0 m/s` |
+| `pitch_small` | `5.0 deg` |
+| `pitch_dive` | `15.0 deg` |
+| `pitch_zoom` | `15.0 deg` |
+| `g_unloaded_upper` | `0.7 G` |
+| `g_high` | `5.5 G` |
+| `g_pull` | `2.0 G` |
+| `g_std_high` | `0.8 G` |
+| `roll_sign_changes` | `2` |
+| `turn_sign_changes` | `2` |
+| `roll_rate_high` | `60.0 deg/s` |
+| `heading_large` | `110.0 deg` |
+| `acc` | `1.0 m/s^2` |
+| `dec` | `1.0 m/s^2` |
 
-- `RandomForestClassifier`
-- `n_estimators=200`
-- `min_samples_split=5`
-- `min_samples_leaf=2`
-- `class_weight="balanced"`
-- `n_jobs=-1`
+## 主ラベル定義
 
-GPU を使いたい場合は、`XGBoost` を選びます。
+### `Straight_Level`
 
-- `--model-type xgboost`
-- `--use-gpu`
+- `turn_rate_mean < turn_small`
+- `abs(vertical_speed_mean) < vs_small`
+- `abs(pitch_mean) < pitch_small`
 
-この指定で `XGBClassifier(tree_method="hist", device="cuda")` を使います。  
-ただし、CUDA 対応 GPU と GPU 対応ビルドの `xgboost` が必要です。`Random Forest` では GPU は使いません。
+### `Straight_Climb`
 
-評価指標:
+- `turn_rate_mean < turn_small`
+- `vertical_speed_mean > vs_up`
 
-- Accuracy
-- Precision
-- Recall
-- F1-score
-- Classification Report
-- Confusion Matrix
-- Feature Importances
+### `Straight_Descent`
 
-実装: `src/maneuver_classifier.py`
+- `turn_rate_mean < turn_small`
+- `vertical_speed_mean < -vs_down`
 
-## Tacview への書き戻し
+### `Level_Turn`
 
-注釈付き ACMI には次のカスタムプロパティを書き込みます。
+- `turn_rate_mean >= turn_large`
+- `abs(vertical_speed_mean) < vs_small`
 
-- `ManeuverLabel`
-- `ManeuverLabelId`
-- `ManeuverRuleBasedLabel`
-- `ManeuverRuleBasedLabelId`
-- `ManeuverWindowStart`
-- `ManeuverWindowEnd`
-- `ManeuverSampleTime`
+### `Climbing_Turn`
 
-意味は次です。
+- `turn_rate_mean >= turn_large`
+- `vertical_speed_mean > vs_up`
 
-- `ManeuverLabel`: 学習済みモデルの予測ラベル。モデル予測がない場合はルールベース仮ラベル
-- `ManeuverRuleBasedLabel`: 常にルールベース仮ラベル
+### `Descending_Turn`
 
-Tacview では Raw Telemetry からこれらの値を確認できます。
+- `turn_rate_mean >= turn_large`
+- `vertical_speed_mean < -vs_down`
 
-実装: `src/maneuver_acmi_export.py`
+### `Dive`
 
-## 使い方
+- `pitch_mean < -pitch_dive`
+- `vertical_speed_mean < -vs_rapid`
 
-### セットアップ
+### `Zoom_Climb`
+
+- `pitch_mean > pitch_zoom`
+- `vertical_speed_mean > vs_rapid_up`
+
+### `Large_Heading_Change`
+
+- `heading_delta >= heading_large`
+- `Oscillatory_Maneuver` に該当する場合は優先しません
+- `Dive` / `Zoom_Climb` が明確に支配的ならそちらを優先します
+
+### `Oscillatory_Maneuver`
+
+- 5 秒窓特徴と 2 秒補助窓特徴の強い方を使って判定します
+- `roll_sign_changes >= threshold` または `turn_sign_changes >= threshold`
+- かつ `roll_rate_peak >= roll_rate_high` または `g_std >= g_std_high`
+
+### `Transition`
+
+現実装では次のいずれかを満たすと `Transition` にします。
+
+- どの具体ラベルにも十分当てはまらない
+- 複数フラグが立ち、上位 2 候補のスコア差が小さい
+- 窓前半と後半で粗い運動状態が異なる
+
+### `Uncertain`
+
+現実装では次のいずれかを満たすと `Uncertain` にします。
+
+- `missing_ratio` が高い
+- `long_gap_ratio` が高い
+- `sensor_conflict` が立つ
+- `feature_out_of_range` が立つ
+- 主要特徴量が非有限値になる
+
+## 補助属性ラベル定義
+
+- `High_G`: `g_mean >= g_high`
+- `Unloaded`: `g_mean <= g_unloaded_upper`
+- `Accelerating`: `speed_slope > acc`
+- `Decelerating`: `speed_slope < -dec`
+- `High_Roll_Rate`: `roll_rate_peak >= roll_rate_high`
+- `High_Turn_Rate`: `turn_rate_peak >= turn_high`
+- `Rapid_Altitude_Change`: `abs(vertical_speed_mean) >= vs_rapid`
+- `Heading_Reversal_Like`: `heading_delta >= heading_large`
+- `Jinking_Like`: 5 秒窓特徴と 2 秒補助窓特徴の強い方で `roll_sign_changes` または `turn_sign_changes` が閾値以上
+
+## 判定ロジック
+
+各窓について次の順に処理します。
+
+1. 特徴量計算
+2. `Uncertain` 判定
+3. 各主ラベル条件フラグ計算
+4. 各主ラベルスコア計算
+5. `Transition` 判定
+6. 優先順位に従って主ラベル決定
+7. 補助属性ラベル決定
+8. CSV 出力レコード生成
+
+出力には以下が含まれます。
+
+- `label`
+- `label_name`
+- `main_label`
+- `attributes`
+- `uncertain_reason`
+- `transition_reason`
+- `flag_*`
+- `score_*`
+- `attr_*`
+
+## 出力仕様
+
+`maneuver_features_labeled.csv` には少なくとも次が含まれます。
+
+- `window_start`
+- `window_end`
+- `window_start_time`
+- `window_end_time`
+- `aircraft_id`
+- `label`
+- `label_name`
+- `main_label`
+- `attributes`
+- 各特徴量列
+- `uncertain_reason`
+- `transition_reason`
+- `flag_*`
+- `score_*`
+- `attr_*`
+
+推論時はさらに次を追加します。
+
+- `predicted_label`
+- `predicted_label_name`
+
+## CLI
+
+### 1 本の ACMI を処理
 
 ```bash
-python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+python src/maneuver_main.py Tacview/example.acmi --window 5 --step 2.5
+python src/maneuver_main.py Tacview/example.acmi --list-aircraft
 ```
 
-### 最初に知っておくこと
-
-- `maneuver_train.py` は「学習用データ作成 + モデル学習」を行うコマンドです。
-- `maneuver_train.py` は学習完了後、デフォルトで入力に使った ACMI 群にも自動で予測を書き戻します。
-- 学習用の結合 CSV から 1 本の ACMI を直接生成するのではなく、入力 ACMI ごとに個別の注釈付き ACMI を出力します。
-- 学習済みモデルを別の ACMI に適用したい場合は、学習後に `maneuver_predict.py` を実行します。
-- `maneuver_train.py` の評価用 `train/test` 分割は内部で自動実行されます。
-- この分割は ACMI ファイル単位ではなく、抽出されたウィンドウサンプル単位です。
-- GPU を使う場合は `--model-type xgboost --use-gpu` を付けます。`--use-gpu` 単独では意味がなく、`Random Forest` ではエラーになります。
-
-### 1 本の ACMI を一括処理する
+### 複数 ACMI から学習
 
 ```bash
 . .venv/bin/activate
-python src/maneuver_main.py Tacview/flight.zip.acmi --output-dir results/run1
+python src/maneuver_train.py Tacview/ --recursive --output-dir results/train
 ```
 
-生成物:
-
-- `results/run1/maneuver_features_labeled.csv`
-- `results/run1/maneuver_rf_model.joblib`
-- `results/run1/confusion_matrix.png`
-- `results/run1/feature_importances.png`
-- `results/run1/<input>.maneuver.zip.acmi`
-
-GPU 学習を使う例:
+### 学習済みモデルで推論
 
 ```bash
 . .venv/bin/activate
-python src/maneuver_main.py \
-  Tacview/flight.zip.acmi \
-  --model-type xgboost \
-  --use-gpu \
-  --output-dir results/run1_gpu
-```
-
-この場合のモデル出力名は `results/run1_gpu/maneuver_xgboost_model.joblib` です。
-
-### 複数 ACMI をまとめて学習する
-
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py \
-  Tacview/file1.zip.acmi \
-  Tacview/file2.zip.acmi \
-  Tacview/file3.zip.acmi \
-  --output-dir results/train_run
-```
-
-生成物:
-
-- `results/train_run/maneuver_features_labeled.csv`
-- `results/train_run/maneuver_rf_model.joblib`
-- `results/train_run/confusion_matrix.png`
-- `results/train_run/feature_importances.png`
-- `results/train_run/predictions/<acmi名>/maneuver_features_labeled.csv`
-- `results/train_run/predictions/<acmi名>/<acmi名>.maneuver.zip.acmi`
-
-GPU 学習を使う場合:
-
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py \
-  Tacview \
+python src/maneuver_predict.py Tacview/ \
   --recursive \
-  --model-type xgboost \
-  --use-gpu \
-  --output-dir results/train_run_gpu
+  --model results/train/maneuver_rf_model.joblib
 ```
 
-この場合のモデル出力名は `results/train_run_gpu/maneuver_xgboost_model.joblib` です。
+### 共通閾値引数
 
-この CSV は複数 ACMI を結合した学習データです。`source_acmi` 列と `source_title` 列で由来を追えます。
+[src/maneuver_main.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_main.py#L273)、[src/maneuver_train.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_train.py#L154)、[src/maneuver_predict.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_predict.py#L84) は共通で次を受け付けます。
 
-重要:
+- `--turn-small-th`
+- `--turn-large-th`
+- `--turn-high-th`
+- `--vs-small-th`
+- `--vs-up-th`
+- `--vs-down-th`
+- `--vs-rapid-th`
+- `--vs-rapid-up-th`
+- `--pitch-small-th`
+- `--pitch-dive-th`
+- `--pitch-zoom-th`
+- `--g-unloaded-th`
+- `--g-high-th`
+- `--g-pull-th`
+- `--g-std-high-th`
+- `--roll-sign-changes-th`
+- `--turn-sign-changes-th`
+- `--roll-rate-high-th`
+- `--heading-large-th`
+- `--acc-th`
+- `--dec-th`
+- `--uncertain-missing-ratio-th`
+- `--uncertain-long-gap-ratio-th`
+- `--transition-score-gap-th`
 
-- `results/train_run/maneuver_features_labeled.csv` は学習用に結合された CSV です。
-- これは複数 ACMI の窓が混ざったデータなので、この CSV をそのまま 1 本の ACMI に書き戻す用途には向きません。
-- そのため、`maneuver_train.py` は学習用の結合 CSV とは別に、各入力 ACMI ごとの予測結果を `predictions/` 配下へ自動出力します。
+## 実装上の近似と未実装
 
-ディレクトリをそのまま渡すこともできます。デフォルトではそのディレクトリ直下の `*.acmi` を読み込みます。
+仕様書に対して、現実装は以下を近似しています。
 
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py Tacview --output-dir results/train_run
-```
+1. `T_acc`, `T_dec`, `T_g_std_high` はデータ分布からの自動再調整ではなく固定初期値です。
+2. `Transition` は本格スコアリングではなく、フラグ数、簡易スコア差、前半/後半判定差で近似しています。
+3. `Uncertain` の `sensor_conflict` は単機量だけから判定できる物理矛盾チェックに限定しています。
+4. 平滑化は Savitzky-Golay ではなく移動平均です。
 
-サブディレクトリも含めて探索したい場合は `--recursive` を使います。
+## 仕様上扱わないもの
 
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py Tacview --recursive --output-dir results/train_run
-```
+相手機情報を使わないため、次は厳密には扱いません。
 
-ファイルとディレクトリを混在させることもできます。
+- `Reversal`
+- `Extension`
+- `Lead_Pursuit`
+- `Lag_Pursuit`
+- `Pure_Pursuit`
+- Offensive / Defensive / Neutral
+- Overshoot
 
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py \
-  Tacview \
-  Tacview/special_case.zip.acmi \
-  --recursive \
-  --output-dir results/train_run
-```
+## モデル互換性
 
-内部で何が起きるか:
+- ラベル体系と特徴量列が旧実装から変わっているため、旧モデルとの互換性はありません
+- 既存モデルを使い回すのではなく再学習が必要です
+- `label` はルールベースラベル、`predicted_label` は学習済みモデルの出力です
 
-1. 指定した ACMI 群から特徴量とルールベース仮ラベルを抽出
-2. それらを 1 つのデータセットに結合
-3. 窓サンプル単位で `train/test` に分割
-4. 指定したモデルを学習
-5. 学習済みモデルを `maneuver_rf_model.joblib` または `maneuver_xgboost_model.joblib` として保存
-6. 入力に使った各 ACMI に対して予測結果を自動で書き戻し、`predictions/` 配下に保存
+## 関連ファイル
 
-つまり、`python src/maneuver_train.py Tacview --output-dir results/train_run` を実行しても、全データが `train` に入るわけではありません。結合後のデータセット全体から、一部が自動で `test` に回されます。
-
-学習後の自動書き戻しを止めたい場合は `--no-annotate-inputs` を使います。
-
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py Tacview \
-  --output-dir results/train_run \
-  --no-annotate-inputs
-```
-
-自動書き戻しの出力先を変えたい場合は `--prediction-output-dir` を使います。
-
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py Tacview \
-  --output-dir results/train_run \
-  --prediction-output-dir results/train_predictions
-```
-
-### 学習済みモデルを別データに適用する
-
-```bash
-. .venv/bin/activate
-python src/maneuver_predict.py \
-  Tacview/new_flight.zip.acmi \
-  --model results/train_run/maneuver_rf_model.joblib \
-  --output-dir results/predict_run
-```
-
-学習済みモデルを入力とは別の ACMI に書き戻したいときは、この `maneuver_predict.py` を使います。
-
-複数ファイルにも対応します。
-
-```bash
-. .venv/bin/activate
-python src/maneuver_predict.py \
-  Tacview/new1.zip.acmi \
-  Tacview/new2.zip.acmi \
-  --model results/train_run/maneuver_rf_model.joblib \
-  --output-dir results/predict_run
-```
-
-出力はファイルごとのサブディレクトリに分かれます。
-
-- `results/predict_run/<acmi名>/maneuver_features_labeled.csv`
-- `results/predict_run/<acmi名>/<acmi名>.maneuver.zip.acmi`
-
-推論でもディレクトリ入力に対応しています。
-
-```bash
-. .venv/bin/activate
-python src/maneuver_predict.py Tacview \
-  --model results/train_run/maneuver_rf_model.joblib \
-  --output-dir results/predict_run
-```
-
-サブディレクトリも含める場合:
-
-```bash
-. .venv/bin/activate
-python src/maneuver_predict.py Tacview --recursive \
-  --model results/train_run/maneuver_rf_model.joblib \
-  --output-dir results/predict_run
-```
-
-学習直後に別の入力群へ適用したい場合の例:
-
-```bash
-. .venv/bin/activate
-python src/maneuver_train.py Tacview --output-dir results/train_run
-python src/maneuver_predict.py Tacview \
-  --model results/train_run/maneuver_rf_model.joblib \
-  --output-dir results/predict_run
-```
-
-`--model` には `maneuver_rf_model.joblib` でも `maneuver_xgboost_model.joblib` でも指定できます。
-
-### 既存 CSV から ACMI だけ書き戻す
-
-```bash
-. .venv/bin/activate
-python src/maneuver_acmi_export.py \
-  Tacview/flight.zip.acmi \
-  --labels-csv results/run1/maneuver_features_labeled.csv \
-  --output results/run1/flight.maneuver.zip.acmi
-```
-
-## 主要オプション
-
-共通でよく使うもの:
-
-- `--window`
-  スライディングウィンドウ幅。デフォルト 5 秒
-- `--step`
-  ウィンドウのステップ幅。デフォルト 1 秒
-- `--aircraft-id`
-  特定機体だけ処理したいときに使用
-- `--output-dir`
-  出力ディレクトリ
-- `--model-type`
-  学習に使う分類器。`random_forest` または `xgboost`
-- `--use-gpu`
-  `xgboost` 選択時に CUDA GPU を使う
-- `--recursive`
-  ディレクトリ入力時にサブディレクトリも再帰的に探索する
-- `--no-annotate-inputs`
-  `maneuver_train.py` 実行後の入力 ACMI への自動書き戻しを無効化する
-- `--prediction-output-dir`
-  `maneuver_train.py` の自動書き戻し結果の出力先を指定する
-
-ルールベース閾値:
-
-- `--heading-delta-th`
-- `--heading-reversal-th`
-- `--altitude-slope-th`
-- `--altitude-slope-steep`
-- `--speed-delta-th`
-- `--speed-loss-highg`
-- `--roll-std-jinking`
-- `--heading-std-jinking`
-
-`maneuver_main.py` 固有:
-
-- `--list-aircraft`
-  入力 ACMI に含まれる解析対象機体一覧だけ表示
-- `--no-annotate-acmi`
-  自動 ACMI 出力を無効化
-- `--annotated-acmi-output`
-  注釈付き ACMI の出力先を明示指定
-
-## 再学習の考え方
-
-このプロジェクトの学習器は `Random Forest` または `XGBoost` ですが、どちらもこの実装では追加データだけを使った継ぎ足し学習はしません。
-
-新しい学習データを増やしたい場合は、次の運用になります。
-
-1. 新しい ACMI を収集する
-2. `maneuver_train.py` に過去の ACMI と新しい ACMI を全部渡す
-3. 毎回まとめて再学習する
-4. 新しく出た `maneuver_rf_model.joblib` または `maneuver_xgboost_model.joblib` を以後の推論で使う
-
-実務的には、学習に使った ACMI 群を固定して `results/train_run/` のようなディレクトリ単位で管理するのが安全です。
-
-## ファイル構成
-
-- `src/acmi_parser.py`
-  Tacview ACMI パーサ
-- `src/maneuver_feature_engine.py`
-  時系列化、前処理、特徴量抽出
-- `src/maneuver_labeler.py`
-  14 クラスのルールベース仮ラベル
-- `src/maneuver_classifier.py`
-  Random Forest / XGBoost 学習、評価、モデル保存
-- `src/maneuver_pipeline.py`
-  学習、推論で共通利用するパイプライン関数
-- `src/maneuver_main.py`
-  単一 ACMI 一括実行
-- `src/maneuver_train.py`
-  複数 ACMI 学習 CLI
-- `src/maneuver_predict.py`
-  学習済みモデル推論 CLI
-- `src/maneuver_acmi_export.py`
-  Tacview 書き戻し
-
-## テスト
-
-```bash
-. .venv/bin/activate
-pytest -q
-```
-
-現時点では全テストが通っています。
-
-## 注意点
-
-- ルールベース仮ラベルはあくまで擬似教師です。閾値の妥当性がモデル性能に直結します。
-- 学習データの偏りが大きいと、よく出るクラスに引っ張られます。
-- `ManeuverLabel` はモデル予測、`ManeuverRuleBasedLabel` は仮ラベルなので、両者が一致しない窓があります。
-- 入力ログ品質が悪い場合、速度や姿勢の補間が推論結果に影響します。
-- 現在の対象は `Air+FixedWing` のみです。
-
-## 実装の現状
-
-この README は現在のコード実装に合わせて書いています。
-
-- 14 クラスのルールベース仮ラベル
-- `Air+FixedWing` 限定の解析対象
-- 複数 ACMI 学習
-- 学習済みモデルの別データ適用
-- Tacview Raw Telemetry への `ManeuverLabel` / `ManeuverRuleBasedLabel` 書き戻し
+- [src/maneuver_feature_engine.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_feature_engine.py)
+- [src/maneuver_labeler.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_labeler.py)
+- [src/maneuver_main.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_main.py)
+- [src/maneuver_train.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_train.py)
+- [src/maneuver_predict.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_predict.py)

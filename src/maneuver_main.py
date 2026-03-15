@@ -5,7 +5,7 @@ Tacview ACMI ログから航空機機動を分類するパイプラインを実�
 
 Usage:
     python src/maneuver_main.py flight.acmi
-    python src/maneuver_main.py flight.acmi --window 5 --step 1 --output-dir results/
+    python src/maneuver_main.py flight.acmi --window 5 --step 2.5 --output-dir results/
     python src/maneuver_main.py flight.acmi --list-aircraft   # 航空機一覧のみ表示
 
 処理フロー:
@@ -35,14 +35,19 @@ from maneuver_feature_engine import (
     get_all_aircraft_ids,
 )
 from maneuver_acmi_export import annotate_acmi_file
-from maneuver_labeler import ManeuverLabeler, MANEUVER_CLASSES
+from maneuver_labeler import (
+    MANEUVER_CLASSES,
+    ManeuverLabeler,
+    add_threshold_arguments,
+    thresholds_from_args,
+)
 from maneuver_classifier import train_and_evaluate, save_model
 
 
 def run_pipeline(
     acmi_path: str,
     window_sec: float = 5.0,
-    step_sec: float = 1.0,
+    step_sec: float = 2.5,
     output_dir: str = "results",
     aircraft_filter: str | None = None,
     thresholds: dict | None = None,
@@ -57,7 +62,7 @@ def run_pipeline(
     Args:
         acmi_path: ACMI ファイルパス
         window_sec: スライディングウィンドウ幅 (秒)
-        step_sec: ステップ (秒)
+        step_sec: ステップ (秒, default: 2.5 = 50% overlap)
         output_dir: 結果出力先ディレクトリ
         aircraft_filter: 特定の航空機IDのみ処理 (None=全て)
         thresholds: ルールベースラベラーの閾値 (None=デフォルト)
@@ -275,8 +280,8 @@ def main():
         help="スライディングウィンドウ幅 (秒, default: 5.0)",
     )
     parser.add_argument(
-        "--step", type=float, default=1.0,
-        help="スライディングウィンドウステップ (秒, default: 1.0)",
+        "--step", type=float, default=2.5,
+        help="スライディングウィンドウステップ (秒, default: 2.5)",
     )
     parser.add_argument(
         "--output-dir", default="results",
@@ -310,48 +315,7 @@ def main():
         help="注釈付き ACMI の出力先 (default: output-dir 配下に自動決定)",
     )
 
-    # ルールベースラベラーの閾値 (14クラス / G-Load対応版)
-    th_group = parser.add_argument_group("ラベラー閾値 (上級)")
-    th_group.add_argument(
-        "--heading-delta-th", type=float, default=5.0,
-        help="旋回判定 heading_delta 閾値 (deg, default: 5.0)",
-    )
-    th_group.add_argument(
-        "--heading-reversal-th", type=float, default=120.0,
-        help="Reversal 判定 heading_delta 閾値 (deg, default: 120.0)",
-    )
-    th_group.add_argument(
-        "--altitude-slope-th", type=float, default=2.0,
-        help="Climb/Descent 判定 altitude_slope 閾値 (m/s, default: 2.0)",
-    )
-    th_group.add_argument(
-        "--altitude-slope-steep", type=float, default=10.0,
-        help="Dive/Zoom 判定 altitude_slope 閾値 (m/s, default: 10.0)",
-    )
-    th_group.add_argument(
-        "--speed-delta-th", type=float, default=5.0,
-        help="加速/減速判定 speed_delta 閾値 (m/s, default: 5.0)",
-    )
-    th_group.add_argument(
-        "--g-load-high-g", type=float, default=4.0,
-        help="High-G Turn 判定 g_load 閾値 (G, default: 4.0)",
-    )
-    th_group.add_argument(
-        "--g-load-unloaded", type=float, default=0.5,
-        help="Dive 判定 unloaded g_load 閾値 (G, default: 0.5)",
-    )
-    th_group.add_argument(
-        "--g-load-zoom", type=float, default=2.0,
-        help="Zoom Climb 判定 g_load 閾値 (G, default: 2.0)",
-    )
-    th_group.add_argument(
-        "--g-std-jinking", type=float, default=1.0,
-        help="Jinking 判定 g_load_std 閾値 (G, default: 1.0)",
-    )
-    th_group.add_argument(
-        "--roll-std-jinking", type=float, default=15.0,
-        help="Jinking 判定 roll_std 閾値 (deg, default: 15.0)",
-    )
+    add_threshold_arguments(parser)
 
     args = parser.parse_args()
 
@@ -367,18 +331,7 @@ def main():
         return
 
     # ---- パイプライン実行 ----
-    thresholds = {
-        "heading_delta_threshold": args.heading_delta_th,
-        "heading_reversal_threshold": args.heading_reversal_th,
-        "altitude_slope_threshold": args.altitude_slope_th,
-        "altitude_slope_steep": args.altitude_slope_steep,
-        "speed_delta_threshold": args.speed_delta_th,
-        "g_load_high_g": args.g_load_high_g,
-        "g_load_unloaded": args.g_load_unloaded,
-        "g_load_zoom": args.g_load_zoom,
-        "g_load_std_jinking": args.g_std_jinking,
-        "roll_std_jinking": args.roll_std_jinking,
-    }
+    thresholds = thresholds_from_args(args)
 
     run_pipeline(
         acmi_path=args.acmi_file,
