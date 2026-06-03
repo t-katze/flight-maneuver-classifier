@@ -91,7 +91,7 @@ DEFAULT_THRESHOLDS = {
     "dec": 1.0,
     "uncertain_missing_ratio": 0.35,
     "uncertain_long_gap_ratio": 0.25,
-    "transition_score_gap": 0.25,
+    "transition_score_gap": 0.35,
     "large_heading_dominance_margin": 0.25,
 }
 

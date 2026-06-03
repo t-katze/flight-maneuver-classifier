@@ -9,8 +9,21 @@ import pandas as pd
 
 
 ANALYSIS_AIRCRAFT_TYPE = "air+fixedwing"
+GRAVITY_MPS2 = 9.80665
 
-REQUIRED_SIGNALS = ["altitude", "speed", "heading", "pitch", "roll", "g_load"]
+RAW_SIGNAL_COLUMNS = ["altitude", "world_x", "world_y", "world_z", "yaw", "pitch", "roll"]
+DERIVED_SIGNAL_COLUMNS = ["speed", "g_load"]
+PROCESSED_SIGNAL_COLUMNS = [
+    "altitude",
+    "world_x",
+    "world_y",
+    "world_z",
+    "speed",
+    "yaw",
+    "pitch",
+    "roll",
+    "g_load",
+]
 WINDOW_COLUMNS = [
     "window_start",
     "window_end",
@@ -91,16 +104,17 @@ def frames_to_aircraft_df(frames, aircraft_id: str) -> pd.DataFrame:
             {
                 "time": frame.time,
                 "altitude": obj.altitude,
-                "speed": obj.speed,
-                "heading": obj.yaw,
+                "world_x": obj.world_x,
+                "world_y": obj.world_y,
+                "world_z": obj.world_z,
+                "yaw": obj.yaw,
                 "pitch": obj.pitch,
                 "roll": obj.roll,
-                "g_load": obj.g_load,
             }
         )
 
     if not rows:
-        return pd.DataFrame(columns=["time"] + REQUIRED_SIGNALS)
+        return pd.DataFrame(columns=["time"] + RAW_SIGNAL_COLUMNS)
 
     return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
 
@@ -118,7 +132,7 @@ def get_all_aircraft_ids(frames) -> dict[str, str]:
 
 
 def _unwrap_degrees(values: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(values, errors="coerce")
+    numeric = pd.to_numeric(values, errors="coerce").astype(float)
     valid = numeric.notna()
     if valid.sum() < 2:
         return numeric
@@ -174,6 +188,64 @@ def _safe_gradient(values: np.ndarray, times: np.ndarray) -> np.ndarray:
         return np.zeros_like(values, dtype=float)
 
 
+def _compute_speed_from_positions(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    times: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    vx = _safe_gradient(x, times)
+    vy = _safe_gradient(y, times)
+    vz = _safe_gradient(z, times)
+    speed = np.sqrt(vx * vx + vy * vy + vz * vz)
+    return speed, vx, vy, vz
+
+
+def _compute_g_load_from_velocity(
+    vx: np.ndarray,
+    vy: np.ndarray,
+    vz: np.ndarray,
+    times: np.ndarray,
+) -> np.ndarray:
+    ax = _safe_gradient(vx, times)
+    ay = _safe_gradient(vy, times)
+    az = _safe_gradient(vz, times)
+    velocity = np.column_stack([vx, vy, vz])
+    acceleration = np.column_stack([ax, ay, az])
+    cross = np.cross(velocity, acceleration)
+    cross_norm = np.linalg.norm(cross, axis=1)
+    speed = np.linalg.norm(velocity, axis=1)
+
+    normal_acc = np.zeros_like(speed, dtype=float)
+    valid = speed > 1e-6
+    normal_acc[valid] = cross_norm[valid] / speed[valid]
+
+    # Load factor is approximated from path-normal acceleration.
+    # In a coordinated level turn, n = sqrt(1 + (a_normal / g)^2).
+    return np.sqrt(1.0 + np.square(normal_acc / GRAVITY_MPS2))
+
+
+def _compute_3d_turn_rate_from_velocity(
+    vx: np.ndarray,
+    vy: np.ndarray,
+    vz: np.ndarray,
+    times: np.ndarray,
+) -> np.ndarray:
+    ax = _safe_gradient(vx, times)
+    ay = _safe_gradient(vy, times)
+    az = _safe_gradient(vz, times)
+    velocity = np.column_stack([vx, vy, vz])
+    acceleration = np.column_stack([ax, ay, az])
+    cross = np.cross(velocity, acceleration)
+    cross_norm = np.linalg.norm(cross, axis=1)
+    speed_sq = np.sum(velocity * velocity, axis=1)
+
+    turn_rate_rad = np.zeros_like(speed_sq, dtype=float)
+    valid = speed_sq > 1e-6
+    turn_rate_rad[valid] = cross_norm[valid] / speed_sq[valid]
+    return np.degrees(turn_rate_rad)
+
+
 def preprocess_timeseries(
     df: pd.DataFrame,
     resample_hz: float = 5.0,
@@ -185,17 +257,18 @@ def preprocess_timeseries(
 
     Steps:
         1. sort by time
-        2. unwrap heading / roll
+        2. unwrap yaw / roll
         3. resample to a fixed rate (default 5 Hz)
         4. fill short gaps by interpolation
-        5. smooth the kinematic signals with a moving average
-        6. derive first-order rates used by the labeler
+        5. smooth position / attitude signals with a moving average
+        6. derive speed, g_load, 3D turn_rate, and first-order rates
     """
     if df.empty:
-        empty_columns = ["time"] + REQUIRED_SIGNALS + [
+        empty_columns = ["time"] + PROCESSED_SIGNAL_COLUMNS + [
             "raw_missing_any",
             "long_gap_flag",
-            "heading_rate",
+            "yaw_rate",
+            "turn_rate",
             "roll_rate",
             "pitch_rate",
             "vertical_speed",
@@ -206,18 +279,15 @@ def preprocess_timeseries(
     work["time"] = pd.to_numeric(work["time"], errors="coerce")
     work = work.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
     if work.empty:
-        return pd.DataFrame(columns=["time"] + REQUIRED_SIGNALS)
+        return pd.DataFrame(columns=["time"] + PROCESSED_SIGNAL_COLUMNS)
 
-    if "g_load" not in work.columns:
-        work["g_load"] = 1.0
-
-    for col in REQUIRED_SIGNALS:
+    for col in RAW_SIGNAL_COLUMNS:
         if col not in work.columns:
             work[col] = np.nan
         work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    work["raw_missing_any"] = 1.0 - work[REQUIRED_SIGNALS].notna().all(axis=1).astype(float)
-    work["heading"] = _unwrap_degrees(work["heading"])
+    work["raw_missing_any"] = 1.0 - work[RAW_SIGNAL_COLUMNS].notna().all(axis=1).astype(float)
+    work["yaw"] = _unwrap_degrees(work["yaw"])
     work["roll"] = _unwrap_degrees(work["roll"])
 
     pitch_numeric = pd.to_numeric(work["pitch"], errors="coerce")
@@ -226,7 +296,7 @@ def preprocess_timeseries(
 
     source_times = work["time"].to_numpy(dtype=float)
     if len(source_times) < 2 or resample_hz <= 0:
-        resampled = work[["time"] + REQUIRED_SIGNALS + ["raw_missing_any"]].copy()
+        resampled = work[["time"] + RAW_SIGNAL_COLUMNS + ["raw_missing_any"]].copy()
         resampled["long_gap_flag"] = 0.0
     else:
         sample_period = 1.0 / resample_hz
@@ -237,7 +307,7 @@ def preprocess_timeseries(
             dtype=float,
         )
         resampled = pd.DataFrame({"time": target_times})
-        for col in REQUIRED_SIGNALS:
+        for col in RAW_SIGNAL_COLUMNS:
             resampled[col] = _resample_numeric_series(
                 source_times,
                 work[col].to_numpy(dtype=float),
@@ -254,18 +324,34 @@ def preprocess_timeseries(
             long_gap_sec=long_gap_sec,
         )
 
-    for col in REQUIRED_SIGNALS:
+    for col in RAW_SIGNAL_COLUMNS:
         resampled[col] = resampled[col].interpolate(method="linear").ffill().bfill()
 
     window_size = max(1, int(round(smoothing_window_sec * resample_hz)))
-    for col in REQUIRED_SIGNALS:
+    for col in RAW_SIGNAL_COLUMNS:
         resampled[col] = _rolling_mean(resampled[col], window_size)
 
     times = resampled["time"].to_numpy(dtype=float)
-    resampled["heading_rate"] = _safe_gradient(
-        resampled["heading"].to_numpy(dtype=float),
+    resampled["altitude"] = resampled["world_y"]
+    speed, vx, vy, vz = _compute_speed_from_positions(
+        resampled["world_x"].to_numpy(dtype=float),
+        resampled["world_y"].to_numpy(dtype=float),
+        resampled["world_z"].to_numpy(dtype=float),
         times,
     )
+    resampled["speed"] = _rolling_mean(pd.Series(speed), window_size).to_numpy(dtype=float)
+    resampled["g_load"] = _rolling_mean(
+        pd.Series(_compute_g_load_from_velocity(vx, vy, vz, times)),
+        window_size,
+    ).to_numpy(dtype=float)
+    resampled["yaw_rate"] = _safe_gradient(
+        resampled["yaw"].to_numpy(dtype=float),
+        times,
+    )
+    resampled["turn_rate"] = _rolling_mean(
+        pd.Series(_compute_3d_turn_rate_from_velocity(vx, vy, vz, times)),
+        window_size,
+    ).to_numpy(dtype=float)
     resampled["roll_rate"] = _safe_gradient(
         resampled["roll"].to_numpy(dtype=float),
         times,
@@ -274,10 +360,7 @@ def preprocess_timeseries(
         resampled["pitch"].to_numpy(dtype=float),
         times,
     )
-    resampled["vertical_speed"] = _safe_gradient(
-        resampled["altitude"].to_numpy(dtype=float),
-        times,
-    )
+    resampled["vertical_speed"] = vy
 
     resampled["raw_missing_any"] = resampled["raw_missing_any"].clip(0.0, 1.0)
     return resampled.reset_index(drop=True)
@@ -332,26 +415,35 @@ def _window_sensor_conflict(window_df: pd.DataFrame) -> bool:
     speed = window_df["speed"].to_numpy(dtype=float)
     pitch = window_df["pitch"].to_numpy(dtype=float)
     g_load = window_df["g_load"].to_numpy(dtype=float)
-    heading_rate = np.abs(window_df["heading_rate"].to_numpy(dtype=float))
+    turn_rate = np.abs(window_df["turn_rate"].to_numpy(dtype=float))
 
     return bool(
         np.any(speed < -1e-6)
         or np.any(np.abs(pitch) > 100.0)
         or np.any((g_load < -3.0) | (g_load > 12.0))
-        or np.any(heading_rate > 200.0)
+        or np.any(turn_rate > 200.0)
     )
 
 
 def _window_feature_out_of_range(window_df: pd.DataFrame) -> bool:
     altitude = window_df["altitude"].to_numpy(dtype=float)
     vertical_speed = np.abs(window_df["vertical_speed"].to_numpy(dtype=float))
+    turn_rate = np.abs(window_df["turn_rate"].to_numpy(dtype=float))
     roll_rate = np.abs(window_df["roll_rate"].to_numpy(dtype=float))
     pitch_rate = np.abs(window_df["pitch_rate"].to_numpy(dtype=float))
 
     return bool(
-        np.any(~np.isfinite(window_df[REQUIRED_SIGNALS + ["heading_rate", "roll_rate", "pitch_rate", "vertical_speed"]].to_numpy(dtype=float)))
+        np.any(
+            ~np.isfinite(
+                window_df[
+                    PROCESSED_SIGNAL_COLUMNS
+                    + ["yaw_rate", "turn_rate", "roll_rate", "pitch_rate", "vertical_speed"]
+                ].to_numpy(dtype=float)
+            )
+        )
         or np.any(altitude < -1000.0)
         or np.any(vertical_speed > 300.0)
+        or np.any(turn_rate > 300.0)
         or np.any(roll_rate > 400.0)
         or np.any(pitch_rate > 200.0)
     )
@@ -379,14 +471,14 @@ def _compute_half_window_features(window_df: pd.DataFrame) -> dict[str, float]:
         second_half = window_df.iloc[-max(2, len(window_df) // 2) :].copy()
 
     return {
-        "first_half_turn_rate_mean": float(np.mean(np.abs(first_half["heading_rate"].to_numpy(dtype=float)))),
-        "second_half_turn_rate_mean": float(np.mean(np.abs(second_half["heading_rate"].to_numpy(dtype=float)))),
+        "first_half_turn_rate_mean": float(np.mean(np.abs(first_half["turn_rate"].to_numpy(dtype=float)))),
+        "second_half_turn_rate_mean": float(np.mean(np.abs(second_half["turn_rate"].to_numpy(dtype=float)))),
         "first_half_vertical_speed_mean": _window_mean(first_half, "vertical_speed"),
         "second_half_vertical_speed_mean": _window_mean(second_half, "vertical_speed"),
         "first_half_pitch_mean": _window_mean(first_half, "pitch"),
         "second_half_pitch_mean": _window_mean(second_half, "pitch"),
-        "first_half_heading_delta": abs(_window_delta(first_half, "heading")),
-        "second_half_heading_delta": abs(_window_delta(second_half, "heading")),
+        "first_half_heading_delta": abs(_window_delta(first_half, "yaw")),
+        "second_half_heading_delta": abs(_window_delta(second_half, "yaw")),
     }
 
 
@@ -439,7 +531,7 @@ def _compute_short_window_features(
         "short_turn_sign_changes_max": float(
             max(
                 _count_sign_changes(
-                    segment["heading_rate"].to_numpy(dtype=float),
+                    segment["yaw_rate"].to_numpy(dtype=float),
                     deadband=0.2,
                 )
                 for segment in segments
@@ -465,7 +557,7 @@ def _compute_short_window_features(
         ),
         "short_turn_rate_peak_max": float(
             max(
-                np.max(np.abs(segment["heading_rate"].to_numpy(dtype=float)))
+                np.max(np.abs(segment["turn_rate"].to_numpy(dtype=float)))
                 for segment in segments
             )
         ),
@@ -516,8 +608,9 @@ def extract_window_features(
         pitch = window_df["pitch"].to_numpy(dtype=float)
         roll = window_df["roll"].to_numpy(dtype=float)
         g_load = window_df["g_load"].to_numpy(dtype=float)
-        heading = window_df["heading"].to_numpy(dtype=float)
-        heading_rate = window_df["heading_rate"].to_numpy(dtype=float)
+        yaw = window_df["yaw"].to_numpy(dtype=float)
+        yaw_rate = window_df["yaw_rate"].to_numpy(dtype=float)
+        turn_rate = window_df["turn_rate"].to_numpy(dtype=float)
         roll_rate = window_df["roll_rate"].to_numpy(dtype=float)
         pitch_rate = window_df["pitch_rate"].to_numpy(dtype=float)
         vertical_speed = window_df["vertical_speed"].to_numpy(dtype=float)
@@ -532,15 +625,15 @@ def extract_window_features(
         roll_mean = float(np.mean(roll))
         g_mean = float(np.mean(g_load))
         g_std = float(np.std(g_load, ddof=0))
-        turn_rate_mean = float(np.mean(np.abs(heading_rate)))
-        turn_rate_peak = float(np.max(np.abs(heading_rate)))
+        turn_rate_mean = float(np.mean(np.abs(turn_rate)))
+        turn_rate_peak = float(np.max(np.abs(turn_rate)))
         roll_rate_mean = float(np.mean(np.abs(roll_rate)))
         roll_rate_peak = float(np.max(np.abs(roll_rate)))
         pitch_rate_mean = float(np.mean(np.abs(pitch_rate)))
         vertical_speed_mean = float(np.mean(vertical_speed))
         vertical_speed_peak = float(np.max(np.abs(vertical_speed)))
-        heading_delta = abs(float(heading[-1] - heading[0]))
-        turn_sign_changes = _count_sign_changes(heading_rate, deadband=0.2)
+        heading_delta = abs(float(yaw[-1] - yaw[0]))
+        turn_sign_changes = _count_sign_changes(yaw_rate, deadband=0.2)
         roll_sign_changes = _count_sign_changes(roll_rate, deadband=1.0)
         pitch_sign_changes = _count_sign_changes(pitch_rate, deadband=0.5)
         alt_residual_std = _linear_residual_std(window_times, altitude)

@@ -34,6 +34,7 @@ import pandas as pd
 
 # 単位変換定数
 KNOTS_TO_MS = 0.514444  # 1 knot = 0.514444 m/s
+GRAVITY_MPS2 = 9.80665
 
 
 # ============================================================
@@ -60,23 +61,25 @@ class ACMIObject:
     pitch: float = 0.0      # deg
     yaw: float = 0.0        # deg (heading)
 
-    # 速度 — TacView プロパティから取得（knots → m/s 変換済）
-    #         取得不可の場合はフレーム間位置差分から推定
-    speed: float = 0.0      # m/s (TAS or 推定値)
+    # 速度・荷重
+    # speed / g_load は Tacview 追加プロパティに依存せず、
+    # 位置差分から常時計算した近似値を保持する。
+    speed: float = 0.0      # m/s
     ias: float = 0.0        # m/s (IAS, TacView から。元は knots)
     tas: float = 0.0        # m/s (TAS, TacView から。元は knots)
     mach: float = 0.0       # マッハ数
     aoa: float = 0.0        # 迎角 (rad, TacView は deg で出力 → 変換)
-    g_load: float = 1.0     # G荷重 (TacView の GLoad プロパティ)
-
-    # TacView が速度プロパティを提供したかのフラグ
-    _has_tas_property: bool = False
+    g_load: float = 1.0     # G荷重 (位置差分由来の近似値)
 
     # 直前のワールド座標 (速度推定用)
     _prev_x: float = 0.0
     _prev_y: float = 0.0
     _prev_z: float = 0.0
     _prev_time: float = -1.0
+    _prev_vx: float = 0.0
+    _prev_vy: float = 0.0
+    _prev_vz: float = 0.0
+    _has_prev_velocity: bool = False
 
     # ワールド座標 (緯度経度から変換)
     world_x: float = 0.0
@@ -417,17 +420,16 @@ class ACMIParser:
                 # TacView: IAS は knots → m/s に変換
                 obj.ias = float(value) * KNOTS_TO_MS
             elif key == "TAS":
-                # TacView: TAS は knots → m/s に変換
+                # TacView: TAS は保持するが、speed は常に座標差分から計算する
                 obj.tas = float(value) * KNOTS_TO_MS
-                obj.speed = obj.tas  # TAS が最も正確
-                obj._has_tas_property = True
             elif key == "Mach":
                 obj.mach = float(value)
             elif key == "AOA":
                 # TacView: AOA は degrees → radians に変換
                 obj.aoa = math.radians(float(value))
             elif key == "GLoad":
-                obj.g_load = float(value)
+                # GLoad が存在しても学習用 speed / g_load には使わない
+                pass
 
     def _parse_transform(self, obj: ACMIObject, value: str):
         """
@@ -460,15 +462,34 @@ class ACMIParser:
             obj.latitude, obj.longitude, obj.altitude
         )
 
-        # 速度: TacView の TAS プロパティがあればそれを優先
-        # なければフレーム間位置差分から推定（対地速度に近い）
-        if not obj._has_tas_property:
-            if obj._prev_time >= 0 and self._current_time > obj._prev_time:
-                dt = self._current_time - obj._prev_time
-                dx = obj.world_x - obj._prev_x
-                dy = obj.world_y - obj._prev_y
-                dz = obj.world_z - obj._prev_z
-                obj.speed = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+        # speed / g_load は常に位置差分から推定する
+        if obj._prev_time >= 0 and self._current_time > obj._prev_time:
+            dt = self._current_time - obj._prev_time
+            dx = obj.world_x - obj._prev_x
+            dy = obj.world_y - obj._prev_y
+            dz = obj.world_z - obj._prev_z
+            vx = dx / dt
+            vy = dy / dt
+            vz = dz / dt
+            obj.speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+            if obj._has_prev_velocity:
+                ax = (vx - obj._prev_vx) / dt
+                ay = (vy - obj._prev_vy) / dt
+                az = (vz - obj._prev_vz) / dt
+                specific_fx = ax
+                specific_fy = ay + GRAVITY_MPS2
+                specific_fz = az
+                obj.g_load = math.sqrt(
+                    specific_fx * specific_fx
+                    + specific_fy * specific_fy
+                    + specific_fz * specific_fz
+                ) / GRAVITY_MPS2
+
+            obj._prev_vx = vx
+            obj._prev_vy = vy
+            obj._prev_vz = vz
+            obj._has_prev_velocity = True
 
         obj._prev_x = obj.world_x
         obj._prev_y = obj.world_y

@@ -80,17 +80,21 @@ Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間�
 
 - `time`
 - `altitude`
-- `speed`
+- `yaw`
 - `pitch`
 - `roll`
-- `heading`
-- `g_load`
+- `world_x`
+- `world_y`
+- `world_z`
 
 ### 任意入力
 
-コードは入力として直接は要求しませんが、内部で次を導出して使います。
+コードは `speed` や `g_load` を Tacview の追加プロパティから読まず、位置差分から内部導出して使います。内部で次を導出します。
 
+- `speed`
+- `g_load`
 - `vertical_speed`
+- `yaw_rate`
 - `roll_rate`
 - `pitch_rate`
 - `turn_rate`
@@ -102,7 +106,7 @@ Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間�
 - `time`: 秒
 - `altitude`: m
 - `speed`: m/s
-- `pitch`, `roll`, `heading`: deg
+- `pitch`, `roll`, `yaw`: deg
 - `g_load`: G
 
 ## 時間窓仕様
@@ -121,12 +125,13 @@ Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間�
 [src/maneuver_feature_engine.py](/home/t-kat/src/flight-maneuver-classifier/src/maneuver_feature_engine.py) で次を実施します。
 
 1. 時刻順ソート
-2. `heading` と `roll` の unwrap
+2. `yaw` と `roll` の unwrap
 3. 欠損を含む数値列の補間
 4. 5 Hz への等間隔リサンプリング
 5. 移動平均による平滑化
-6. `heading_rate`, `roll_rate`, `pitch_rate`, `vertical_speed` の導出
-7. 長い欠損区間の比率と、物理的に不自然な値の検出
+6. 位置差分から `speed`, `g_load`, 3D `turn_rate` を導出
+7. `yaw_rate`, `roll_rate`, `pitch_rate`, `vertical_speed` の導出
+8. 長い欠損区間の比率と、物理的に不自然な値の検出
 
 ## 特徴量仕様
 
@@ -155,6 +160,9 @@ Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間�
 - `vertical_speed_mean`
 - `vertical_speed_peak`
 
+`turn_rate` は単純な `yaw_rate` ではなく、3 次元速度ベクトルの向き変化から計算する空間的な旋回率です。
+`g_load` は Tacview の `GLoad` を使わず、軌跡の法線加速度から推定した近似荷重倍数です。
+
 ### 方位変化・振動特徴量
 
 - `heading_delta`
@@ -162,6 +170,19 @@ Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間�
 - `roll_sign_changes`
 - `pitch_sign_changes`
 - `alt_residual_std`
+
+`heading_delta` と `turn_sign_changes` は `yaw` / `yaw_rate` から計算します。
+
+## G 推定の注意
+
+現実装の `g_load` は、軌跡の曲率から推定した計算値です。式の考え方は以下です。
+
+- 3 次元速度ベクトル `v`
+- その時間微分である加速度 `a`
+- 法線加速度 `a_normal = |v x a| / |v|`
+- 推定荷重倍数 `n = sqrt(1 + (a_normal / g)^2)`
+
+以前の実装では位置の 2 階微分ノイズに敏感な式になっており、格闘戦ログで `g_mean` が非現実的に大きくなりやすい問題がありました。現在は、より安定な曲率ベース推定へ変更しています。
 
 ### 補助派生特徴量
 
@@ -360,6 +381,31 @@ Tacview ACMI ログから固定翼機の単機時系列を抽出し、短時間�
 - `predicted_label`
 - `predicted_label_name`
 
+ACMI へ書き戻す際は、主ラベルだけでなく次も Raw Telemetry のカスタムプロパティとして可能な限り出力します。
+
+- `attributes`
+- `attribute_count`
+- `uncertain_reason`
+- `transition_reason`
+- `flag_*`
+- `attr_*`
+- `score_*`
+- 上位スコア候補
+- 主要な補助数値特徴量
+
+Tacview の Raw Telemetry 画面で `Name` ソートしたときに見やすいよう、プロパティ名は番号付きで出力します。主な並びは次です。
+
+- `Maneuver010Pred*`: モデル予測
+- `Maneuver020Rule*`: ルールベース判定
+- `Maneuver030Main*`: 採用された主ラベル
+- `Maneuver040*`: 補助属性概要
+- `Maneuver050*`: `Uncertain` / `Transition` 理由
+- `Maneuver190*` 以降: active flags / active attributes
+- `Maneuver200Flag*`: 主ラベル判定フラグ
+- `Maneuver300Attr*`: 補助属性の個別ブール
+- `Maneuver400Score*`: 各主ラベルスコア
+- `Maneuver500*`: 主要数値特徴量
+
 ## CLI
 
 ### 1 本の ACMI を処理
@@ -384,6 +430,20 @@ python src/maneuver_train.py Tacview/ --recursive --output-dir results/train
 python src/maneuver_predict.py Tacview/ \
   --recursive \
   --model results/train/maneuver_rf_model.joblib
+```
+
+### Tacview 上で手動修正して再学習
+
+Tacview アドオンは [main.lua](/home/t-kat/src/flight-maneuver-classifier/Tacview_Addon_Guide/ManualLabelEditor/main.lua) にあります。注釈付き ACMI を Tacview で開き、対象機を右クリックして `Manual Label` から主ラベルを選ぶと、`manual_label_edits.csv` に修正内容を保存します。
+
+その修正を既存の `maneuver_features_labeled.csv` に反映して再学習するには、次を実行します。
+
+```bash
+. .venv/bin/activate
+python src/maneuver_retrain_from_labels.py \
+  results/run1/maneuver_features_labeled.csv \
+  --manual-edits-csv Tacview_Addon_Guide/ManualLabelEditor/manual_label_edits.csv \
+  --output-dir results/retrain_manual
 ```
 
 ### 共通閾値引数

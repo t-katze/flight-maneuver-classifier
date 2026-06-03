@@ -46,6 +46,49 @@ def _normalize_object_id(value) -> str:
     return text
 
 
+def _snake_to_property_suffix(value: str) -> str:
+    parts = [part for part in str(value).strip("_").split("_") if part]
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def _property_name(prefix: str, order: int, name: str) -> str:
+    return f"{prefix}{order:03d}{name}"
+
+
+def _is_truthy(value) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, (bool, int)):
+        return bool(value)
+    if isinstance(value, float):
+        return value != 0.0
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y"}
+
+
+def _format_boolish(value) -> str:
+    return "1" if _is_truthy(value) else "0"
+
+
+def _safe_getattr(row, name: str, default=None):
+    return getattr(row, name, default)
+
+
+def _append_text_property(properties: list[str], key: str, value):
+    if value is None or pd.isna(value):
+        return
+    text = str(value).strip()
+    if not text:
+        return
+    properties.append(f"{key}={_escape_acmi_text(text)}")
+
+
+def _append_number_property(properties: list[str], key: str, value):
+    if value is None or pd.isna(value):
+        return
+    properties.append(f"{key}={_format_number(value)}")
+
+
 def read_acmi_text(path: str) -> tuple[str, str | None]:
     acmi_path = Path(path)
     if acmi_path.suffix == ".zip" or str(acmi_path).endswith(".zip.acmi"):
@@ -190,6 +233,9 @@ def build_annotation_schedule(
     frame_texts = [time_text for time_text, _ in frame_markers]
     frame_times = [time_value for _, time_value in frame_markers]
     scheduled_updates: dict[str, dict[str, str]] = {}
+    flag_columns = [c for c in labels_df.columns if c.startswith("flag_")]
+    score_columns = [c for c in labels_df.columns if c.startswith("score_")]
+    attr_columns = [c for c in labels_df.columns if c.startswith("attr_")]
 
     for row in labels_df.sort_values(
         by=["window_start", "window_end", "aircraft_id"],
@@ -213,28 +259,161 @@ def build_annotation_schedule(
             primary_label = getattr(row, "label", None)
 
         properties = [
-            f"{property_prefix}Label={_escape_acmi_text(primary_label_name)}",
-            f"{property_prefix}WindowStart={_format_number(row.window_start)}",
-            f"{property_prefix}WindowEnd={_format_number(row.window_end)}",
-            f"{property_prefix}SampleTime={_format_number(anchor_time)}",
+            f"{_property_name(property_prefix, 10, 'PredLabel')}={_escape_acmi_text(primary_label_name)}",
+            f"{_property_name(property_prefix, 70, 'WindowStart')}={_format_number(row.window_start)}",
+            f"{_property_name(property_prefix, 71, 'WindowEnd')}={_format_number(row.window_end)}",
+            f"{_property_name(property_prefix, 72, 'SampleTime')}={_format_number(anchor_time)}",
         ]
 
         if primary_label is not None and not pd.isna(primary_label):
-            properties.insert(1, f"{property_prefix}LabelId={int(primary_label)}")
+            properties.insert(
+                1,
+                f"{_property_name(property_prefix, 11, 'PredLabelId')}={int(primary_label)}",
+            )
 
         rule_based_label_name = getattr(row, "rule_based_label_name", None)
         if not rule_based_label_name:
             rule_based_label_name = getattr(row, "label_name", None)
         if rule_based_label_name:
             properties.append(
-                f"{property_prefix}RuleBasedLabel={_escape_acmi_text(rule_based_label_name)}"
+                f"{_property_name(property_prefix, 20, 'RuleLabel')}={_escape_acmi_text(rule_based_label_name)}"
             )
 
         rule_based_label = getattr(row, "rule_based_label", None)
         if rule_based_label is None or pd.isna(rule_based_label):
             rule_based_label = getattr(row, "label", None)
         if rule_based_label is not None and not pd.isna(rule_based_label):
-            properties.append(f"{property_prefix}RuleBasedLabelId={int(rule_based_label)}")
+            properties.append(
+                f"{_property_name(property_prefix, 21, 'RuleLabelId')}={int(rule_based_label)}"
+            )
+
+        main_label_name = _safe_getattr(row, "main_label", None)
+        if not main_label_name:
+            main_label_name = _safe_getattr(row, "label_name", None)
+        _append_text_property(
+            properties,
+            _property_name(property_prefix, 30, "MainLabel"),
+            main_label_name,
+        )
+
+        main_label_id = _safe_getattr(row, "main_label_id", None)
+        if main_label_id is None or pd.isna(main_label_id):
+            main_label_id = _safe_getattr(row, "label", None)
+        if main_label_id is not None and not pd.isna(main_label_id):
+            properties.append(
+                f"{_property_name(property_prefix, 31, 'MainLabelId')}={int(main_label_id)}"
+            )
+
+        _append_text_property(
+            properties,
+            _property_name(property_prefix, 40, "Attributes"),
+            _safe_getattr(row, "attributes", None),
+        )
+        attribute_count = _safe_getattr(row, "attribute_count", None)
+        if attribute_count is not None and not pd.isna(attribute_count):
+            properties.append(
+                f"{_property_name(property_prefix, 41, 'AttributeCount')}={int(attribute_count)}"
+            )
+        _append_text_property(
+            properties,
+            _property_name(property_prefix, 50, "UncertainReason"),
+            _safe_getattr(row, "uncertain_reason", None),
+        )
+        _append_text_property(
+            properties,
+            _property_name(property_prefix, 51, "TransitionReason"),
+            _safe_getattr(row, "transition_reason", None),
+        )
+
+        active_flags = []
+        for column in flag_columns:
+            value = _safe_getattr(row, column, None)
+            suffix = _snake_to_property_suffix(column.removeprefix("flag_"))
+            properties.append(
+                f"{_property_name(property_prefix, 200, f'Flag{suffix}')}={_format_boolish(value)}"
+            )
+            if _is_truthy(value):
+                active_flags.append(column.removeprefix("flag_"))
+        if active_flags:
+            properties.append(
+                f"{_property_name(property_prefix, 190, 'ActiveFlags')}={_escape_acmi_text(';'.join(active_flags))}"
+            )
+
+        active_attributes = []
+        for column in attr_columns:
+            value = _safe_getattr(row, column, None)
+            suffix = _snake_to_property_suffix(column.removeprefix("attr_"))
+            properties.append(
+                f"{_property_name(property_prefix, 300, f'Attr{suffix}')}={_format_boolish(value)}"
+            )
+            if _is_truthy(value):
+                active_attributes.append(column.removeprefix("attr_"))
+        if active_attributes:
+            properties.append(
+                f"{_property_name(property_prefix, 290, 'ActiveAttributes')}={_escape_acmi_text(';'.join(active_attributes))}"
+            )
+
+        score_pairs: list[tuple[str, float]] = []
+        for column in score_columns:
+            raw_value = _safe_getattr(row, column, None)
+            if raw_value is None or pd.isna(raw_value):
+                continue
+            suffix = _snake_to_property_suffix(column.removeprefix("score_"))
+            properties.append(
+                f"{_property_name(property_prefix, 400, f'Score{suffix}')}={_format_number(raw_value)}"
+            )
+            score_pairs.append((column.removeprefix("score_"), float(raw_value)))
+
+        if score_pairs:
+            ranked_scores = sorted(score_pairs, key=lambda item: item[1], reverse=True)
+            top_label, top_score = ranked_scores[0]
+            properties.append(
+                f"{_property_name(property_prefix, 410, 'TopScoreLabel')}={_escape_acmi_text(top_label)}"
+            )
+            properties.append(
+                f"{_property_name(property_prefix, 411, 'TopScore')}={_format_number(top_score)}"
+            )
+            if len(ranked_scores) >= 2:
+                second_label, second_score = ranked_scores[1]
+                properties.append(
+                    f"{_property_name(property_prefix, 412, 'SecondScoreLabel')}={_escape_acmi_text(second_label)}"
+                )
+                properties.append(
+                    f"{_property_name(property_prefix, 413, 'SecondScore')}={_format_number(second_score)}"
+                )
+
+        for numeric_column in (
+            "g_mean",
+            "g_std",
+            "turn_rate_mean",
+            "turn_rate_peak",
+            "roll_rate_peak",
+            "vertical_speed_mean",
+            "heading_delta",
+            "speed_slope",
+        ):
+            value = _safe_getattr(row, numeric_column, None)
+            if value is None or pd.isna(value):
+                continue
+            suffix = _snake_to_property_suffix(numeric_column)
+            properties.append(
+                f"{_property_name(property_prefix, 500, suffix)}={_format_number(value)}"
+            )
+
+        g_mean_value = _safe_getattr(row, "g_mean", None)
+        if g_mean_value is not None and not pd.isna(g_mean_value):
+            properties.append(
+                f"{_property_name(property_prefix, 500, 'ComputedGMean')}={_format_number(g_mean_value)}"
+            )
+        g_std_value = _safe_getattr(row, "g_std", None)
+        if g_std_value is not None and not pd.isna(g_std_value):
+            properties.append(
+                f"{_property_name(property_prefix, 500, 'ComputedGStd')}={_format_number(g_std_value)}"
+            )
+        properties.append(
+            f"{_property_name(property_prefix, 52, 'ComputedGSource')}="
+            f"{_escape_acmi_text('trajectory_curvature_estimate')}"
+        )
 
         scheduled_updates.setdefault(frame_key, {})[aircraft_id] = (
             f"{aircraft_id}," + ",".join(properties)
